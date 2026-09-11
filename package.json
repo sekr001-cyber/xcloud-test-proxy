@@ -1,7 +1,7 @@
 {
-  "name": "vps-proxy",
+  "name": "xcloud-test-proxy",
   "version": "1.0.0",
-  "description": "VPS proxy and streaming test server",
+  "description": "Private web gateway for controlled testing",
   "type": "module",
   "scripts": {
     "start": "node server.js"
