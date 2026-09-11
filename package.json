@@ -1,7 +1,7 @@
 {
   "name": "xcloud-test-proxy",
-  "version": "1.0.0",
-  "description": "Private web gateway for controlled testing",
+  "version": "1.1.0",
+  "description": "Private web gateway for controlled HTTP/HTTPS testing",
   "type": "module",
   "scripts": {
     "start": "node server.js"
