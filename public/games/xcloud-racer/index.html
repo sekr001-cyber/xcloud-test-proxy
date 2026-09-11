@@ -2,10 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta
-    name="viewport"
-    content="width=device-width, initial-scale=1"
-  >
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
   <title>XCloud Racer</title>
 
@@ -14,218 +11,189 @@
 
 <body>
 
-<div id="game">
+  <!-- Hela spelets område -->
+  <div id="gameContainer">
 
-  <canvas id="game"></canvas>
+    <!-- Själva spelgrafiken -->
+    <canvas id="game"></canvas>
 
-  <div class="hud">
+    <!-- HUD -->
+    <div class="hud">
 
-    <div class="hud-left">
+      <div class="hud-left">
 
-      <div class="hud-box">
-        <span class="hud-label">
-          Position
-        </span>
-
-        <span
-          class="hud-value"
-          id="position"
-        >
-          1/8
-        </span>
-      </div>
-
-      <div class="hud-box">
-        <span class="hud-label">
-          Lap
-        </span>
-
-        <span
-          class="hud-value"
-          id="lap"
-        >
-          1/3
-        </span>
-      </div>
-
-    </div>
-
-    <div class="hud-right">
-
-      <div class="hud-box">
-        <span class="hud-label">
-          Speed
-        </span>
-
-        <span
-          class="hud-value"
-          id="speed"
-        >
-          0
-        </span>
-      </div>
-
-      <div class="hud-box">
-        <span class="hud-label">
-          Time
-        </span>
-
-        <span
-          class="hud-value"
-          id="time"
-        >
-          00:00.00
-        </span>
-      </div>
-
-    </div>
-
-  </div>
-
-  <div
-    class="boost-container"
-  >
-
-    <div class="boost-label">
-      <span>BOOST</span>
-      <span id="boostText">
-        SHIFT
-      </span>
-    </div>
-
-    <div class="boost-bar">
-      <div
-        class="boost-fill"
-        id="boostFill"
-      ></div>
-    </div>
-
-  </div>
-
-  <div
-    class="controls"
-  >
-    <strong>WASD</strong>
-    / Arrow keys — Drive<br>
-    <strong>SHIFT</strong>
-    — Boost
-  </div>
-
-  <div
-    class="mobile-controls"
-  >
-
-    <button
-      class="mobile-button mobile-left"
-      id="mobileLeft"
-    >
-      ◀
-    </button>
-
-    <button
-      class="mobile-button mobile-right"
-      id="mobileRight"
-    >
-      ▶
-    </button>
-
-    <button
-      class="mobile-button mobile-gas"
-      id="mobileGas"
-    >
-      ▲
-    </button>
-
-    <button
-      class="mobile-button mobile-brake"
-      id="mobileBrake"
-    >
-      ▼
-    </button>
-
-  </div>
-
-  <div
-    class="countdown"
-    id="countdown"
-  >
-    3
-  </div>
-
-  <div
-    class="overlay"
-    id="startScreen"
-  >
-
-    <div class="panel">
-
-      <h1>
-        XCloud Racer
-      </h1>
-
-      <p>
-        Race against AI opponents,
-        complete three laps and
-        finish first.
-      </p>
-
-      <p>
-        WASD / Arrow keys to drive.
-        Hold SHIFT for boost.
-      </p>
-
-      <button
-        id="startButton"
-      >
-        START RACE
-      </button>
-
-    </div>
-
-  </div>
-
-  <div
-    class="overlay finish"
-    id="finishScreen"
-  >
-
-    <div class="panel">
-
-      <h1>
-        FINISH
-      </h1>
-
-      <div class="result">
-
-        <div
-          class="result-position"
-          id="resultPosition"
-        >
-          #1
+        <div class="hud-box">
+          <span class="hud-label">Position</span>
+          <span class="hud-value" id="position">1/8</span>
         </div>
 
-        <div
-          class="result-time"
-          id="resultTime"
-        >
-          00:00.00
+        <div class="hud-box">
+          <span class="hud-label">Lap</span>
+          <span class="hud-value" id="lap">1/3</span>
         </div>
 
       </div>
 
+      <div class="hud-right">
+
+        <div class="hud-box">
+          <span class="hud-label">Speed</span>
+          <span class="hud-value" id="speed">0</span>
+        </div>
+
+        <div class="hud-box">
+          <span class="hud-label">Time</span>
+          <span class="hud-value" id="timer">00:00.00</span>
+        </div>
+
+      </div>
+
+    </div>
+
+
+    <!-- Boost -->
+    <div class="boost-container">
+
+      <div class="boost-label">
+        <span>BOOST</span>
+        <span id="boostPercent">100%</span>
+      </div>
+
+      <div class="boost-bar">
+        <div
+          class="boost-fill"
+          id="boostFill"
+        ></div>
+      </div>
+
+    </div>
+
+
+    <!-- Countdown -->
+    <div
+      class="countdown"
+      id="countdown"
+    >
+      3
+    </div>
+
+
+    <!-- Keyboard controls -->
+    <div class="controls">
+
+      <strong>Controls</strong><br>
+
+      W / ↑ — Accelerate<br>
+      S / ↓ — Brake<br>
+      A / ← — Turn left<br>
+      D / → — Turn right<br>
+      SHIFT — Boost
+
+    </div>
+
+
+    <!-- Mobile controls -->
+    <div class="mobile-controls">
+
       <button
-        id="restartButton"
+        class="mobile-button mobile-left"
+        id="mobileLeft"
       >
-        RACE AGAIN
+        ◀
       </button>
+
+      <button
+        class="mobile-button mobile-right"
+        id="mobileRight"
+      >
+        ▶
+      </button>
+
+      <button
+        class="mobile-button mobile-gas"
+        id="mobileGas"
+      >
+        ▲
+      </button>
+
+      <button
+        class="mobile-button mobile-brake"
+        id="mobileBrake"
+      >
+        ▼
+      </button>
+
+    </div>
+
+
+    <!-- Start screen -->
+    <div
+      class="overlay"
+      id="startScreen"
+    >
+
+      <div class="panel">
+
+        <h1>XCLOUD RACER</h1>
+
+        <p>
+          Race against AI drivers and finish first.
+        </p>
+
+        <p>
+          3 laps · 8 drivers · Boost
+        </p>
+
+        <button id="startButton">
+          START RACE
+        </button>
+
+      </div>
+
+    </div>
+
+
+    <!-- Finish screen -->
+    <div
+      class="overlay finish"
+      id="finishScreen"
+    >
+
+      <div class="panel">
+
+        <h1>FINISH</h1>
+
+        <div class="result">
+
+          <div
+            class="result-position"
+            id="finalPosition"
+          >
+            1st
+          </div>
+
+          <div
+            class="result-time"
+            id="finalTime"
+          >
+            00:00.00
+          </div>
+
+        </div>
+
+        <button id="restartButton">
+          RACE AGAIN
+        </button>
+
+      </div>
 
     </div>
 
   </div>
 
-</div>
 
-<script src="game.js"></script>
+  <!-- Game JavaScript -->
+  <script src="game.js"></script>
 
 </body>
 </html>
