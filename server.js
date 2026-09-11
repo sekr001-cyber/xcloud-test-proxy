@@ -1,769 +1,752 @@
 import express from "express";
-import http from "http";
-import https from "https";
+import path from "path";
 import dns from "dns";
-import dnsPromises from "dns/promises";
 import net from "net";
-import crypto from "crypto";
-
-dns.setDefaultResultOrder("ipv4first");
+import { fileURLToPath } from "url";
 
 const app = express();
 
-const PORT = Number(process.env.PORT || 10000);
-const TIMEOUT = 30000;
-const MAX_BODY = 20 * 1024 * 1024;
+const PORT = process.env.PORT || 10000;
+const HOST = "0.0.0.0";
 
-const sessions = new Map();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-/* =========================================================
-   EXPRESS
-   ========================================================= */
+const PUBLIC_DIR = path.join(__dirname, "public");
+const GAMES_DIR = path.join(PUBLIC_DIR, "games");
 
-app.use(express.json({ limit: "5mb" }));
-app.use(express.urlencoded({ extended: true, limit: "5mb" }));
+// ---------------------------------------------------------
+// EXPRESS SETUP
+// ---------------------------------------------------------
 
-/* =========================================================
-   SESSION / COOKIES
-   ========================================================= */
+app.disable("x-powered-by");
 
-function createSession() {
-  const id = crypto.randomBytes(24).toString("hex");
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 
-  const session = {
-    cookies: new Map(),
-    created: Date.now()
-  };
+// ---------------------------------------------------------
+// STATIC WEBSITE
+// ---------------------------------------------------------
 
-  sessions.set(id, session);
+// Main XCloud website
+app.use(express.static(PUBLIC_DIR));
 
-  return {
-    id,
-    session
-  };
-}
+// Games
+app.use(
+  "/games",
+  express.static(GAMES_DIR, {
+    index: "index.html"
+  })
+);
 
-function getSession(req, res) {
-  const existing = req.headers["x-proxy-session"];
+// /games -> main XCloud page
+app.get("/games", (req, res) => {
+  res.sendFile(path.join(PUBLIC_DIR, "index.html"));
+});
 
-  if (
-    typeof existing === "string" &&
-    sessions.has(existing)
-  ) {
-    return {
-      id: existing,
-      session: sessions.get(existing)
-    };
+app.get("/games/", (req, res) => {
+  res.sendFile(path.join(PUBLIC_DIR, "index.html"));
+});
+
+// ---------------------------------------------------------
+// HEALTH
+// ---------------------------------------------------------
+
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "XCloud",
+    time: new Date().toISOString()
+  });
+});
+
+// ---------------------------------------------------------
+// NETWORK DEBUG
+// ---------------------------------------------------------
+
+app.get("/debug-network", async (req, res) => {
+  const host = req.query.host || "example.com";
+
+  try {
+    const addresses = await dns.promises.lookup(host, {
+      all: true,
+      verbatim: false
+    });
+
+    res.json({
+      ok: true,
+      host,
+      addresses
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      host,
+      error: error.message
+    });
   }
+});
 
-  const created = createSession();
-
-  res.setHeader("X-Proxy-Session", created.id);
-
-  return created;
-}
-
-function cookieHeader(session) {
-  const cookies = [];
-
-  for (const entry of session.cookies.entries()) {
-    cookies.push(entry[0] + "=" + entry[1]);
-  }
-
-  return cookies.join("; ");
-}
-
-function storeCookies(session, headers) {
-  if (!headers) {
-    return;
-  }
-
-  const list = Array.isArray(headers) ? headers : [headers];
-
-  for (const item of list) {
-    const first = String(item).split(";")[0];
-    const separator = first.indexOf("=");
-
-    if (separator < 1) {
-      continue;
-    }
-
-    const name = first.slice(0, separator).trim();
-    const value = first.slice(separator + 1).trim();
-
-    if (name) {
-      session.cookies.set(name, value);
-    }
-  }
-}
-
-/* =========================================================
-   SSRF PROTECTION
-   ========================================================= */
+// ---------------------------------------------------------
+// SSRF PROTECTION
+// ---------------------------------------------------------
 
 function isPrivateIPv4(ip) {
-  const p = ip.split(".").map(Number);
+  const parts = ip.split(".").map(Number);
 
-  if (p.length !== 4 || p.some(Number.isNaN)) {
+  if (parts.length !== 4 || parts.some(Number.isNaN)) {
+    return false;
+  }
+
+  const [a, b] = parts;
+
+  // 10.0.0.0/8
+  if (a === 10) return true;
+
+  // 127.0.0.0/8
+  if (a === 127) return true;
+
+  // 169.254.0.0/16
+  if (a === 169 && b === 254) return true;
+
+  // 172.16.0.0/12
+  if (a === 172 && b >= 16 && b <= 31) return true;
+
+  // 192.168.0.0/16
+  if (a === 192 && b === 168) return true;
+
+  // 0.0.0.0/8
+  if (a === 0) return true;
+
+  return false;
+}
+
+function isPrivateIPv6(ip) {
+  const normalized = ip.toLowerCase();
+
+  if (normalized === "::1") return true;
+  if (normalized === "::") return true;
+
+  // fc00::/7
+  if (
+    normalized.startsWith("fc") ||
+    normalized.startsWith("fd")
+  ) {
     return true;
   }
 
-  if (p[0] === 10) return true;
-  if (p[0] === 127) return true;
-  if (p[0] === 0) return true;
-
-  if (p[0] === 169 && p[1] === 254) {
-    return true;
-  }
-
-  if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) {
-    return true;
-  }
-
-  if (p[0] === 192 && p[1] === 168) {
+  // fe80::/10
+  if (
+    normalized.startsWith("fe8") ||
+    normalized.startsWith("fe9") ||
+    normalized.startsWith("fea") ||
+    normalized.startsWith("feb")
+  ) {
     return true;
   }
 
   return false;
 }
 
-function isBlockedIP(ip) {
-  if (net.isIPv4(ip)) {
-    return isPrivateIPv4(ip);
+function isPrivateAddress(address) {
+  if (net.isIPv4(address)) {
+    return isPrivateIPv4(address);
   }
 
-  if (net.isIPv6(ip)) {
-    const value = ip.toLowerCase();
-
-    if (value === "::1") return true;
-    if (value.startsWith("fc")) return true;
-    if (value.startsWith("fd")) return true;
-    if (value.startsWith("fe80:")) return true;
-
-    return false;
+  if (net.isIPv6(address)) {
+    return isPrivateIPv6(address);
   }
 
   return true;
 }
 
-async function checkTarget(url) {
+async function validateTarget(hostname) {
+  const lower = hostname.toLowerCase();
+
+  // Block localhost-style hostnames
   if (
-    url.protocol !== "http:" &&
-    url.protocol !== "https:"
+    lower === "localhost" ||
+    lower.endsWith(".localhost") ||
+    lower === "local"
   ) {
-    throw new Error("Only HTTP and HTTPS are supported");
+    throw new Error("Blocked hostname");
   }
 
-  const hostname = url.hostname.toLowerCase();
-
-  if (
-    hostname === "localhost" ||
-    hostname.endsWith(".localhost")
-  ) {
-    throw new Error("Localhost targets are blocked");
-  }
-
-  if (net.isIP(hostname)) {
-    if (isBlockedIP(hostname)) {
-      throw new Error("Private IP targets are blocked");
-    }
-
-    return;
-  }
-
-  const addresses = await dnsPromises.lookup(hostname, {
+  const addresses = await dns.promises.lookup(hostname, {
     all: true,
     verbatim: false
   });
 
   if (!addresses.length) {
-    throw new Error("DNS returned no addresses");
+    throw new Error("Could not resolve hostname");
   }
 
-  for (const address of addresses) {
-    if (isBlockedIP(address.address)) {
-      throw new Error(
-        "Target resolves to a private or local address"
-      );
+  for (const item of addresses) {
+    if (isPrivateAddress(item.address)) {
+      throw new Error("Target resolves to a private address");
+    }
+  }
+
+  return addresses;
+}
+
+// ---------------------------------------------------------
+// COOKIE STORAGE
+// ---------------------------------------------------------
+
+const sessions = new Map();
+
+function getSession(req) {
+  let sessionId = req.headers["x-xcloud-session"];
+
+  if (!sessionId || typeof sessionId !== "string") {
+    sessionId =
+      Math.random().toString(36).slice(2) +
+      Math.random().toString(36).slice(2);
+  }
+
+  if (!sessions.has(sessionId)) {
+    sessions.set(sessionId, {
+      cookies: new Map(),
+      created: Date.now()
+    });
+  }
+
+  return {
+    id: sessionId,
+    data: sessions.get(sessionId)
+  };
+}
+
+// Clean old sessions every 30 minutes
+setInterval(() => {
+  const now = Date.now();
+
+  for (const [id, session] of sessions.entries()) {
+    if (now - session.created > 1000 * 60 * 60 * 6) {
+      sessions.delete(id);
+    }
+  }
+}, 1000 * 60 * 30);
+
+// ---------------------------------------------------------
+// COOKIE HELPERS
+// ---------------------------------------------------------
+
+function parseSetCookie(cookieString) {
+  if (!cookieString) return null;
+
+  const firstPart = cookieString.split(";")[0];
+  const separator = firstPart.indexOf("=");
+
+  if (separator === -1) return null;
+
+  const name = firstPart.slice(0, separator).trim();
+  const value = firstPart.slice(separator + 1).trim();
+
+  if (!name) return null;
+
+  return {
+    name,
+    value
+  };
+}
+
+function storeCookies(session, response) {
+  const cookies = response.headers.getSetCookie
+    ? response.headers.getSetCookie()
+    : [];
+
+  for (const cookie of cookies) {
+    const parsed = parseSetCookie(cookie);
+
+    if (!parsed) continue;
+
+    if (parsed.value === "") {
+      session.cookies.delete(parsed.name);
+    } else {
+      session.cookies.set(parsed.name, parsed.value);
     }
   }
 }
 
-/* =========================================================
-   OUTBOUND REQUEST
-   ========================================================= */
-
-function requestTarget(url, method, headers, body) {
-  return new Promise(function (resolve, reject) {
-    const secure = url.protocol === "https:";
-    const transport = secure ? https : http;
-
-    const options = {
-      protocol: url.protocol,
-      hostname: url.hostname,
-      port: url.port
-        ? Number(url.port)
-        : secure
-          ? 443
-          : 80,
-      path: url.pathname + url.search,
-      method: method,
-      headers: headers,
-      family: 4,
-      timeout: TIMEOUT
-    };
-
-    const request = transport.request(
-      options,
-      function (response) {
-        const chunks = [];
-        let size = 0;
-
-        response.on("data", function (chunk) {
-          size += chunk.length;
-
-          if (size > MAX_BODY) {
-            request.destroy(
-              new Error("Response exceeded size limit")
-            );
-            return;
-          }
-
-          chunks.push(chunk);
-        });
-
-        response.on("end", function () {
-          resolve({
-            status: response.statusCode || 502,
-            headers: response.headers,
-            body: Buffer.concat(chunks)
-          });
-        });
-
-        response.on("error", reject);
-      }
-    );
-
-    request.on("timeout", function () {
-      request.destroy(
-        new Error("Upstream request timed out")
-      );
-    });
-
-    request.on("error", function (error) {
-      reject(error);
-    });
-
-    if (body && body.length) {
-      request.write(body);
-    }
-
-    request.end();
-  });
+function buildCookieHeader(session) {
+  return Array.from(session.cookies.entries())
+    .map(([name, value]) => `${name}=${value}`)
+    .join("; ");
 }
 
-/* =========================================================
-   HTML REWRITING
-   ========================================================= */
+// ---------------------------------------------------------
+// URL HELPERS
+// ---------------------------------------------------------
 
-function makeAbsolute(value, base) {
-  try {
-    return new URL(value, base).toString();
-  } catch {
-    return null;
+function normalizeUrl(input) {
+  if (!input) {
+    throw new Error("Missing URL");
   }
+
+  let value = input.trim();
+
+  if (!/^https?:\/\//i.test(value)) {
+    value = "https://" + value;
+  }
+
+  const url = new URL(value);
+
+  if (!["http:", "https:"].includes(url.protocol)) {
+    throw new Error("Only HTTP and HTTPS are supported");
+  }
+
+  return url;
 }
 
-function proxyLink(url) {
-  return "/proxy?url=" + encodeURIComponent(url);
-}
+// ---------------------------------------------------------
+// HTML REWRITING
+// ---------------------------------------------------------
 
 function rewriteHtml(html, baseUrl) {
-  let result = html;
+  const base = new URL(baseUrl);
 
-  result = result.replace(
-    /<base\s+[^>]*>/gi,
-    ""
-  );
-
-  result = result.replace(
-    /(href|src|action|poster)=["']([^"']+)["']/gi,
-    function (match, attribute, value) {
-      const lower = value.toLowerCase();
+  // Rewrite common HTML attributes
+  html = html.replace(
+    /\b(href|src|action|poster)=("([^"]*)"|'([^']*)')/gi,
+    (match, attribute, quotedValue, doubleValue, singleValue) => {
+      const value = doubleValue ?? singleValue;
 
       if (
-        lower.startsWith("#") ||
-        lower.startsWith("data:") ||
-        lower.startsWith("javascript:") ||
-        lower.startsWith("mailto:") ||
-        lower.startsWith("tel:")
+        !value ||
+        value.startsWith("#") ||
+        value.startsWith("data:") ||
+        value.startsWith("javascript:") ||
+        value.startsWith("mailto:")
       ) {
         return match;
       }
 
-      const absolute = makeAbsolute(value, baseUrl);
+      try {
+        const absolute = new URL(value, base).href;
 
-      if (!absolute) {
+        return `${attribute}="/proxy?url=${encodeURIComponent(
+          absolute
+        )}"`;
+      } catch {
         return match;
       }
+    }
+  );
 
+  // Rewrite CSS url(...)
+  html = html.replace(
+    /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi,
+    (match, quote, value) => {
       if (
-        !absolute.startsWith("http://") &&
-        !absolute.startsWith("https://")
+        value.startsWith("data:") ||
+        value.startsWith("#") ||
+        value.startsWith("http://") ||
+        value.startsWith("https://")
       ) {
-        return match;
-      }
+        try {
+          const absolute = new URL(value, base).href;
 
-      return (
-        attribute +
-        '="' +
-        proxyLink(absolute) +
-        '"'
-      );
-    }
-  );
-
-  result = result.replace(
-    /url\(\s*["']?([^)"']+)["']?\s*\)/gi,
-    function (match, value) {
-      const lower = value.toLowerCase();
-
-      if (
-        lower.startsWith("data:") ||
-        lower.startsWith("http://") ||
-        lower.startsWith("https://")
-      ) {
-        return match;
-      }
-
-      const absolute = makeAbsolute(value, baseUrl);
-
-      if (!absolute) {
-        return match;
-      }
-
-      return "url(" + proxyLink(absolute) + ")";
-    }
-  );
-
-  result = result.replace(
-    /<meta[^>]+http-equiv=["']Content-Security-Policy["'][^>]*>/gi,
-    ""
-  );
-
-  return result;
-}
-
-/* =========================================================
-   PROXY ROUTE
-   ========================================================= */
-
-app.all("/proxy", async function (req, res) {
-  const raw = req.query.url;
-
-  if (!raw || typeof raw !== "string") {
-    return res.status(400).json({
-      error: "Missing url",
-      example: "/proxy?url=https://example.com"
-    });
-  }
-
-  let target;
-
-  try {
-    target = new URL(raw);
-  } catch {
-    return res.status(400).json({
-      error: "Invalid URL"
-    });
-  }
-
-  try {
-    await checkTarget(target);
-
-    const sessionInfo = getSession(req, res);
-    const session = sessionInfo.session;
-
-    const headers = {};
-
-    const allowed = [
-      "accept",
-      "accept-language",
-      "content-type",
-      "referer",
-      "origin",
-      "user-agent"
-    ];
-
-    for (const name of allowed) {
-      const value = req.headers[name];
-
-      if (value) {
-        headers[name] = value;
-      }
-    }
-
-    headers["user-agent"] =
-      headers["user-agent"] ||
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36";
-
-    const cookies = cookieHeader(session);
-
-    if (cookies) {
-      headers.cookie = cookies;
-    }
-
-    let body = null;
-
-    if (
-      req.method !== "GET" &&
-      req.method !== "HEAD"
-    ) {
-      if (typeof req.body === "string") {
-        body = Buffer.from(req.body);
-      } else if (req.body && typeof req.body === "object") {
-        const contentType = String(
-          req.headers["content-type"] || ""
-        );
-
-        if (
-          contentType.includes("application/json")
-        ) {
-          body = Buffer.from(
-            JSON.stringify(req.body)
-          );
-        } else {
-          body = Buffer.from(
-            new URLSearchParams(req.body).toString()
-          );
+          return `url("/proxy?url=${encodeURIComponent(
+            absolute
+          )}")`;
+        } catch {
+          return match;
         }
       }
+
+      return match;
     }
+  );
 
-    const upstream = await requestTarget(
-      target,
-      req.method,
-      headers,
-      body
-    );
+  // Inject a small helper script that redirects normal links
+  // through the proxy.
+  const injectedScript = `
+<script>
+(function () {
+  document.addEventListener("click", function (event) {
+    const link = event.target.closest("a");
 
-    storeCookies(
-      session,
-      upstream.headers["set-cookie"]
-    );
+    if (!link) return;
 
-    /* ---------- REDIRECT ---------- */
+    const href = link.href;
+
+    if (!href) return;
 
     if (
-      upstream.headers.location &&
-      [301, 302, 303, 307, 308].includes(
-        upstream.status
-      )
+      href.startsWith("javascript:") ||
+      href.startsWith("mailto:") ||
+      href.startsWith("#")
     ) {
-      const destination = makeAbsolute(
-        upstream.headers.location,
-        target.toString()
-      );
-
-      if (destination) {
-        return res.redirect(
-          upstream.status,
-          "/proxy?url=" +
-            encodeURIComponent(destination)
-        );
-      }
+      return;
     }
-
-    /* ---------- BODY ---------- */
-
-    let responseBody = upstream.body;
-
-    const contentType = String(
-      upstream.headers["content-type"] || ""
-    ).toLowerCase();
-
-    if (contentType.includes("text/html")) {
-      const text = responseBody.toString("utf8");
-
-      responseBody = Buffer.from(
-        rewriteHtml(
-          text,
-          target.toString()
-        ),
-        "utf8"
-      );
-    }
-
-    /* ---------- HEADERS ---------- */
-
-    const blockedHeaders = new Set([
-      "content-length",
-      "content-encoding",
-      "transfer-encoding",
-      "connection",
-      "keep-alive",
-      "content-security-policy",
-      "x-frame-options",
-      "set-cookie"
-    ]);
-
-    for (const key of Object.keys(
-      upstream.headers
-    )) {
-      if (
-        blockedHeaders.has(key.toLowerCase())
-      ) {
-        continue;
-      }
-
-      const value = upstream.headers[key];
-
-      if (value !== undefined) {
-        res.setHeader(key, value);
-      }
-    }
-
-    res.status(upstream.status);
-
-    res.setHeader(
-      "X-Proxy-Upstream",
-      target.hostname
-    );
-
-    res.end(responseBody);
-  } catch (error) {
-    console.error(
-      "[PROXY ERROR]",
-      error
-    );
-
-    return res.status(502).json({
-      error: "Bad gateway",
-      message:
-        error.message ||
-        "Unknown upstream error",
-      target: target.toString()
-    });
-  }
-});
-
-/* =========================================================
-   BROWSER
-   ========================================================= */
-
-app.get("/", function (req, res) {
-  res.redirect("/browser");
-});
-
-app.get("/browser", function (req, res) {
-  const html = [
-    "<!DOCTYPE html>",
-    "<html>",
-    "<head>",
-    '<meta charset="UTF-8">',
-    '<meta name="viewport" content="width=device-width,initial-scale=1">',
-    "<title>XCloud Browser</title>",
-    "<style>",
-    "*{box-sizing:border-box}",
-    "body{margin:0;background:#111;color:#fff;font-family:Arial,sans-serif}",
-    ".bar{height:64px;background:#1b1b1b;border-bottom:1px solid #333;display:flex;align-items:center;gap:12px;padding:10px 14px}",
-    ".logo{font-size:18px;font-weight:bold;white-space:nowrap}",
-    "form{display:flex;flex:1;gap:8px}",
-    "input{flex:1;background:#292929;color:white;border:1px solid #444;border-radius:8px;padding:12px;font-size:15px;outline:none}",
-    "button{background:white;color:#111;border:0;border-radius:8px;padding:0 18px;font-weight:bold;cursor:pointer}",
-    ".main{height:calc(100vh - 64px);display:flex;align-items:center;justify-content:center;text-align:center}",
-    ".box{width:min(700px,90%)}",
-    "h1{font-size:44px;margin:0 0 10px}",
-    "p{color:#aaa}",
-    ".search{height:50px;margin-top:24px}",
-    ".search button{height:50px}",
-    "</style>",
-    "</head>",
-    "<body>",
-    '<div class="bar">',
-    '<div class="logo">XCloud Browser</div>',
-    '<form id="nav">',
-    '<input id="address" placeholder="Search DuckDuckGo or enter a URL..." autocomplete="off">',
-    "<button>Go</button>",
-    "</form>",
-    "</div>",
-    '<div class="main">',
-    '<div class="box">',
-    "<h1>DuckDuckGo</h1>",
-    "<p>Search the web or enter a website address.</p>",
-    '<form id="search" class="search">',
-    '<input id="query" placeholder="Search the web..." autocomplete="off">',
-    "<button>Search</button>",
-    "</form>",
-    "</div>",
-    "</div>",
-    "<script>",
-    "function go(value){",
-    "value=value.trim();",
-    "if(!value)return;",
-    "var target;",
-    "if(value.indexOf('http://')===0||value.indexOf('https://')===0){",
-    "target=value;",
-    "}else if(value.indexOf('.')!==-1&&!value.includes(' ')){",
-    "target='https://'+value;",
-    "}else{",
-    "target='https://duckduckgo.com/?q='+encodeURIComponent(value)+'&kl=se-sv';",
-    "}",
-    "window.location.href='/proxy?url='+encodeURIComponent(target);",
-    "}",
-    "document.getElementById('nav').addEventListener('submit',function(e){",
-    "e.preventDefault();",
-    "go(document.getElementById('address').value);",
-    "});",
-    "document.getElementById('search').addEventListener('submit',function(e){",
-    "e.preventDefault();",
-    "go(document.getElementById('query').value);",
-    "});",
-    "</script>",
-    "</body>",
-    "</html>"
-  ].join("");
-
-  res.type("html").send(html);
-});
-
-/* =========================================================
-   HEALTH
-   ========================================================= */
-
-app.get("/health", function (req, res) {
-  res.json({
-    ok: true,
-    service: "xcloud-test-proxy",
-    runtime: "render",
-    node: process.version,
-    sessions: sessions.size,
-    time: new Date().toISOString()
-  });
-});
-
-/* =========================================================
-   NETWORK TEST
-   ========================================================= */
-
-app.get("/debug-network", async function (req, res) {
-  const hosts = [
-    "example.com",
-    "duckduckgo.com"
-  ];
-
-  const results = [];
-
-  for (const hostname of hosts) {
-    const result = {
-      hostname: hostname
-    };
 
     try {
-      const addresses =
-        await dnsPromises.lookup(
-          hostname,
-          {
-            all: true,
-            verbatim: false
+      const url = new URL(href);
+
+      if (url.protocol === "http:" || url.protocol === "https:") {
+        event.preventDefault();
+        window.location.href =
+          "/proxy?url=" + encodeURIComponent(url.href);
+      }
+    } catch {}
+  });
+})();
+</script>
+`;
+
+  if (/<\/body>/i.test(html)) {
+    html = html.replace(/<\/body>/i, injectedScript + "</body>");
+  } else {
+    html += injectedScript;
+  }
+
+  return html;
+}
+
+// ---------------------------------------------------------
+// PROXY
+// ---------------------------------------------------------
+
+app.all("/proxy", async (req, res) => {
+  let targetUrl;
+
+  try {
+    targetUrl = normalizeUrl(req.query.url);
+  } catch (error) {
+    return res.status(400).send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <title>XCloud Proxy</title>
+        <style>
+          body {
+            background:#08090c;
+            color:white;
+            font-family:Arial,sans-serif;
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            min-height:100vh;
+            margin:0;
           }
-        );
+          .box {
+            max-width:600px;
+            padding:35px;
+            border:1px solid #292d35;
+            border-radius:16px;
+            background:#111419;
+          }
+          h1 { margin-top:0; }
+          p { color:#9da4b1; }
+        </style>
+      </head>
+      <body>
+        <div class="box">
+          <h1>Invalid URL</h1>
+          <p>${escapeHtml(error.message)}</p>
+        </div>
+      </body>
+      </html>
+    `);
+  }
 
-      result.dns = addresses;
+  try {
+    await validateTarget(targetUrl.hostname);
+  } catch (error) {
+    return res.status(403).send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <title>XCloud Proxy</title>
+        <style>
+          body {
+            background:#08090c;
+            color:white;
+            font-family:Arial,sans-serif;
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            min-height:100vh;
+            margin:0;
+          }
+          .box {
+            max-width:600px;
+            padding:35px;
+            border:1px solid #292d35;
+            border-radius:16px;
+            background:#111419;
+          }
+          h1 { margin-top:0; }
+          p { color:#9da4b1; }
+        </style>
+      </head>
+      <body>
+        <div class="box">
+          <h1>Target blocked</h1>
+          <p>${escapeHtml(error.message)}</p>
+        </div>
+      </body>
+      </html>
+    `);
+  }
 
-      const target =
-        new URL(
-          "https://" +
-          hostname +
-          "/"
-        );
+  const { id: sessionId, data: session } = getSession(req);
 
-      const start = Date.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20000);
 
-      const response =
-        await requestTarget(
-          target,
-          "GET",
-          {
-            accept: "*/*",
-            "user-agent":
-              "XCloud-Debug/1.0"
-          },
-          null
-        );
+  try {
+    const headers = {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+      "Accept":
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language":
+        req.headers["accept-language"] || "en-US,en;q=0.9",
+      "Cache-Control": "no-cache"
+    };
 
-      result.status =
-        response.status;
+    const cookieHeader = buildCookieHeader(session);
 
-      result.ms =
-        Date.now() - start;
-    } catch (error) {
-      result.error =
-        error.message;
+    if (cookieHeader) {
+      headers.Cookie = cookieHeader;
+    }
 
-      if (error.code) {
-        result.code =
-          error.code;
+    // Forward a safe subset of request headers
+    if (req.headers["content-type"]) {
+      headers["Content-Type"] = req.headers["content-type"];
+    }
+
+    if (req.headers["referer"]) {
+      headers.Referer = req.headers["referer"];
+    }
+
+    let body;
+
+    if (!["GET", "HEAD"].includes(req.method)) {
+      if (typeof req.body === "object" && req.body !== null) {
+        body = JSON.stringify(req.body);
+        headers["Content-Type"] =
+          headers["Content-Type"] || "application/json";
+      } else if (typeof req.body === "string") {
+        body = req.body;
       }
     }
 
-    results.push(result);
-  }
+    const response = await fetch(targetUrl.href, {
+      method: req.method,
+      headers,
+      body,
+      redirect: "manual",
+      signal: controller.signal
+    });
 
-  res.json({
-    ok: true,
-    node: process.version,
-    ipv4First: true,
-    results: results
-  });
+    storeCookies(session, response);
+
+    // -----------------------------------------------------
+    // REDIRECTS
+    // -----------------------------------------------------
+
+    if (
+      response.status >= 300 &&
+      response.status < 400 &&
+      response.headers.get("location")
+    ) {
+      const location = new URL(
+        response.headers.get("location"),
+        targetUrl
+      );
+
+      const redirectUrl =
+        "/proxy?url=" + encodeURIComponent(location.href);
+
+      res.setHeader("X-XCloud-Session", sessionId);
+      return res.redirect(response.status, redirectUrl);
+    }
+
+    // -----------------------------------------------------
+    // RESPONSE HEADERS
+    // -----------------------------------------------------
+
+    const contentType =
+      response.headers.get("content-type") || "application/octet-stream";
+
+    res.setHeader("X-XCloud-Session", sessionId);
+
+    const headersToForward = [
+      "content-type",
+      "content-language",
+      "cache-control",
+      "etag",
+      "last-modified",
+      "content-disposition"
+    ];
+
+    for (const header of headersToForward) {
+      const value = response.headers.get(header);
+
+      if (value) {
+        res.setHeader(header, value);
+      }
+    }
+
+    // -----------------------------------------------------
+    // HTML
+    // -----------------------------------------------------
+
+    if (
+      contentType.includes("text/html") ||
+      contentType.includes("application/xhtml+xml")
+    ) {
+      const text = await response.text();
+
+      const rewritten = rewriteHtml(
+        text,
+        targetUrl.href
+      );
+
+      res.status(response.status).send(rewritten);
+      return;
+    }
+
+    // -----------------------------------------------------
+    // OTHER CONTENT
+    // -----------------------------------------------------
+
+    const arrayBuffer = await response.arrayBuffer();
+
+    res.status(response.status).send(
+      Buffer.from(arrayBuffer)
+    );
+  } catch (error) {
+    console.error("Proxy error:", error);
+
+    if (error.name === "AbortError") {
+      return res.status(504).json({
+        ok: false,
+        error: "Target request timed out"
+      });
+    }
+
+    return res.status(502).json({
+      ok: false,
+      error: "Proxy request failed",
+      details: error.message
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 });
 
-/* =========================================================
-   404
-   ========================================================= */
+// ---------------------------------------------------------
+// ESCAPE HTML
+// ---------------------------------------------------------
 
-app.use(function (req, res) {
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+// ---------------------------------------------------------
+// 404
+// ---------------------------------------------------------
+
+app.use((req, res) => {
+  if (req.accepts("html")) {
+    return res.status(404).send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="UTF-8">
+        <title>XCloud - 404</title>
+        <style>
+          * {
+            box-sizing:border-box;
+          }
+
+          body {
+            margin:0;
+            min-height:100vh;
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            background:#08090c;
+            color:white;
+            font-family:Arial,sans-serif;
+          }
+
+          .box {
+            text-align:center;
+            padding:40px;
+          }
+
+          h1 {
+            font-size:80px;
+            margin:0;
+          }
+
+          p {
+            color:#8f96a3;
+          }
+
+          a {
+            display:inline-block;
+            margin-top:15px;
+            padding:12px 20px;
+            background:white;
+            color:black;
+            border-radius:8px;
+            text-decoration:none;
+            font-weight:700;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="box">
+          <h1>404</h1>
+          <p>Page not found.</p>
+          <a href="/">Back to XCloud</a>
+        </div>
+      </body>
+      </html>
+    `);
+  }
+
   res.status(404).json({
+    ok: false,
     error: "Not found"
   });
 });
 
-/* =========================================================
-   START
-   ========================================================= */
+// ---------------------------------------------------------
+// START SERVER
+// ---------------------------------------------------------
 
-app.listen(
-  PORT,
-  "0.0.0.0",
-  function () {
-    console.log("");
-    console.log(
-      "================================"
-    );
-    console.log(
-      "XCloud Web Gateway"
-    );
-    console.log(
-      "================================"
-    );
-    console.log(
-      "Port: " + PORT
-    );
-    console.log(
-      "Node: " + process.version
-    );
-    console.log(
-      "IPv4-first: enabled"
-    );
-    console.log(
-      "DuckDuckGo: enabled"
-    );
-    console.log(
-      "Proxy: enabled"
-    );
-    console.log(
-      "================================"
-    );
-    console.log("");
-  }
-);
+app.listen(PORT, HOST, () => {
+  console.log("======================================");
+  console.log("        XCLOUD SERVER ONLINE");
+  console.log("======================================");
+  console.log(`Port: ${PORT}`);
+  console.log(`Public: ${PUBLIC_DIR}`);
+  console.log(`Games: ${GAMES_DIR}`);
+  console.log("--------------------------------------");
+  console.log("Website:");
+  console.log(`http://localhost:${PORT}/`);
+  console.log("--------------------------------------");
+  console.log("Games:");
+  console.log(`http://localhost:${PORT}/games/`);
+  console.log("--------------------------------------");
+  console.log("XCloud Racer:");
+  console.log(
+    `http://localhost:${PORT}/games/xcloud-racer/`
+  );
+  console.log("--------------------------------------");
+});
