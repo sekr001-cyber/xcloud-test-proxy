@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <title>XCloud</title>
+
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+  <div class="app">
+
+    <!-- SIDEBAR -->
+    <aside class="sidebar">
+
+      <div class="logo">
+        <div class="logo-mark">X</div>
+        <span>XCLOUD</span>
+      </div>
+
+      <nav class="navigation">
+
+        <button class="nav-item active" data-page="home">
+          <span class="nav-icon">⌂</span>
+          <span>Home</span>
+        </button>
+
+        <button class="nav-item" data-page="browser">
+          <span class="nav-icon">◉</span>
+          <span>Browser</span>
+        </button>
+
+        <button class="nav-item" data-page="games">
+          <span class="nav-icon">🎮</span>
+          <span>Games</span>
+        </button>
+
+        <button class="nav-item" data-page="settings">
+          <span class="nav-icon">⚙</span>
+          <span>Settings</span>
+        </button>
+
+      </nav>
+
+      <div class="sidebar-bottom">
+        <div class="version">
+          XCLOUD
+          <span>v1.0</span>
+        </div>
+      </div>
+
+    </aside>
+
+
+    <!-- MAIN CONTENT -->
+    <main class="main">
+
+      <!-- TOP BAR -->
+      <header class="topbar">
+
+        <div class="mobile-logo">
+          XCLOUD
+        </div>
+
+        <div class="page-title" id="pageTitle">
+          Home
+        </div>
+
+        <div class="top-actions">
+
+          <div class="status">
+            <span class="status-dot"></span>
+            Online
+          </div>
+
+        </div>
+
+      </header>
+
+
+      <!-- ================= HOME ================= -->
+
+      <section
+        class="page active-page"
+        id="homePage"
+      >
+
+        <div class="hero">
+
+          <div class="hero-content">
+
+            <span class="eyebrow">
+              WELCOME TO XCLOUD
+            </span>
+
+            <h1>
+              Your web.<br>
+              Your games.
+            </h1>
+
+            <p>
+              A simple cloud browser and gaming platform.
+            </p>
+
+            <button
+              class="primary-button"
+              data-open-page="games"
+            >
+              Browse Games
+            </button>
+
+          </div>
+
+        </div>
+
+      </section>
+
+
+      <!-- ================= BROWSER ================= -->
+
+      <section
+        class="page"
+        id="browserPage"
+      >
+
+        <div class="browser-page">
+
+          <span class="eyebrow">
+            XCLOUD BROWSER
+          </span>
+
+          <h1>Browse the web.</h1>
+
+          <p>
+            Enter a website below to open it through XCloud.
+          </p>
+
+          <form
+            class="search-box"
+            id="browserForm"
+          >
+
+            <input
+              type="text"
+              id="browserInput"
+              placeholder="https://example.com"
+              autocomplete="off"
+            >
+
+            <button type="submit">
+              Open
+            </button>
+
+          </form>
+
+        </div>
+
+      </section>
+
+
+      <!-- ================= GAMES ================= -->
+
+      <section
+        class="page"
+        id="gamesPage"
+      >
+
+        <div class="games-header">
+
+          <div>
+
+            <span class="eyebrow">
+              XCLOUD GAMES
+            </span>
+
+            <h1>Choose a game.</h1>
+
+            <p>
+              Play instantly. More games are coming soon.
+            </p>
+
+          </div>
+
+          <div class="game-count">
+            <strong>1</strong>
+            <span>Game available</span>
+          </div>
+
+        </div>
+
+
+        <!-- GAME GRID -->
+
+        <div class="games-grid">
+
+
+          <!-- XCLOUD RACER -->
+
+          <article class="game-card featured">
+
+            <div class="game-image racer-image">
+
+              <div class="racer-glow"></div>
+
+              <div class="racer-car">
+                🏎️
+              </div>
+
+              <div class="game-badge">
+                AVAILABLE
+              </div>
+
+            </div>
+
+            <div class="game-info">
+
+              <div class="game-info-top">
+
+                <div>
+
+                  <h2>
+                    XCloud Racer
+                  </h2>
+
+                  <p>
+                    Arcade Racing
+                  </p>
+
+                </div>
+
+                <div class="game-rating">
+                  ★ 4.8
+                </div>
+
+              </div>
+
+              <p class="game-description">
+                Race against AI drivers across fast-paced
+                circuits. Drift, boost and fight for first place.
+              </p>
+
+              <div class="game-tags">
+
+                <span>Racing</span>
+                <span>2D</span>
+                <span>AI</span>
+
+              </div>
+
+              <button
+                class="play-button"
+                data-game="racer"
+              >
+                PLAY NOW
+                <span>→</span>
+              </button>
+
+            </div>
+
+          </article>
+
+
+          <!-- COMING SOON -->
+
+          <article class="game-card locked">
+
+            <div class="game-image coming-image">
+
+              <div class="lock">
+                🔒
+              </div>
+
+              <div class="coming-label">
+                COMING SOON
+              </div>
+
+            </div>
+
+            <div class="game-info">
+
+              <h2>
+                XCloud Arena
+              </h2>
+
+              <p>
+                Multiplayer
+              </p>
+
+              <p class="game-description">
+                Competitive multiplayer action is coming
+                to XCloud.
+              </p>
+
+              <button
+                class="disabled-button"
+                disabled
+              >
+                COMING SOON
+              </button>
+
+            </div>
+
+          </article>
+
+
+          <!-- COMING SOON -->
+
+          <article class="game-card locked">
+
+            <div class="game-image coming-image purple">
+
+              <div class="lock">
+                🔒
+              </div>
+
+              <div class="coming-label">
+                COMING SOON
+              </div>
+
+            </div>
+
+            <div class="game-info">
+
+              <h2>
+                XCloud Drift
+              </h2>
+
+              <p>
+                Racing
+              </p>
+
+              <p class="game-description">
+                A dedicated drifting game with custom cars
+                and leaderboards.
+              </p>
+
+              <button
+                class="disabled-button"
+                disabled
+              >
+                COMING SOON
+              </button>
+
+            </div>
+
+          </article>
+
+
+          <!-- COMING SOON -->
+
+          <article class="game-card locked">
+
+            <div class="game-image coming-image blue">
+
+              <div class="lock">
+                🔒
+              </div>
+
+              <div class="coming-label">
+                COMING SOON
+              </div>
+
+            </div>
+
+            <div class="game-info">
+
+              <h2>
+                XCloud Football
+              </h2>
+
+              <p>
+                Sports
+              </p>
+
+              <p class="game-description">
+                Fast arcade football with online matches.
+              </p>
+
+              <button
+                class="disabled-button"
+                disabled
+              >
+                COMING SOON
+              </button>
+
+            </div>
+
+          </article>
+
+
+        </div>
+
+      </section>
+
+
+      <!-- ================= SETTINGS ================= -->
+
+      <section
+        class="page"
+        id="settingsPage"
+      >
+
+        <div class="settings-page">
+
+          <span class="eyebrow">
+            XCLOUD
+          </span>
+
+          <h1>Settings</h1>
+
+          <div class="settings-card">
+
+            <div>
+              <strong>Interface</strong>
+              <p>Dark XCloud interface</p>
+            </div>
+
+            <span class="setting-status">
+              ACTIVE
+            </span>
+
+          </div>
+
+          <div class="settings-card">
+
+            <div>
+              <strong>Games</strong>
+              <p>XCloud Games launcher</p>
+            </div>
+
+            <span class="setting-status">
+              ENABLED
+            </span>
+
+          </div>
+
+        </div>
+
+      </section>
+
+    </main>
+
+  </div>
+
+
+  <!-- GAME LAUNCHER -->
+
+  <script>
+
+    const navItems =
+      document.querySelectorAll(".nav-item");
+
+    const pages =
+      document.querySelectorAll(".page");
+
+    const pageTitle =
+      document.getElementById("pageTitle");
+
+
+    function openPage(page) {
+
+      pages.forEach((item) => {
+
+        item.classList.remove("active-page");
+
+      });
+
+
+      navItems.forEach((item) => {
+
+        item.classList.remove("active");
+
+      });
+
+
+      const target =
+        document.getElementById(page + "Page");
+
+      if (target) {
+
+        target.classList.add("active-page");
+
+      }
+
+
+      const nav =
+        document.querySelector(
+          `[data-page="${page}"]`
+        );
+
+      if (nav) {
+
+        nav.classList.add("active");
+
+      }
+
+
+      const titles = {
+
+        home: "Home",
+        browser: "Browser",
+        games: "Games",
+        settings: "Settings"
+
+      };
+
+
+      pageTitle.textContent =
+        titles[page] || "XCloud";
+
+    }
+
+
+    navItems.forEach((item) => {
+
+      item.addEventListener("click", () => {
+
+        openPage(
+          item.dataset.page
+        );
+
+      });
+
+    });
+
+
+    document
+      .querySelectorAll("[data-open-page]")
+      .forEach((button) => {
+
+        button.addEventListener("click", () => {
+
+          openPage(
+            button.dataset.openPage
+          );
+
+        });
+
+      });
+
+
+    /*
+      OPEN XCLOUD RACER
+    */
+
+    document
+      .querySelectorAll("[data-game]")
+      .forEach((button) => {
+
+        button.addEventListener("click", () => {
+
+          if (
+            button.dataset.game === "racer"
+          ) {
+
+            window.location.href =
+              "/games/xcloud-racer/";
+
+          }
+
+        });
+
+      });
+
+
+    /*
+      BROWSER
+    */
+
+    document
+      .getElementById("browserForm")
+      .addEventListener("submit", (event) => {
+
+        event.preventDefault();
+
+        const input =
+          document.getElementById("browserInput");
+
+        let url =
+          input.value.trim();
+
+        if (!url) return;
+
+        if (
+          !url.startsWith("http://") &&
+          !url.startsWith("https://")
+        ) {
+
+          url =
+            "https://" + url;
+
+        }
+
+        window.location.href =
+          "/proxy?url=" +
+          encodeURIComponent(url);
+
+      });
+
+  </script>
+
+</body>
+</html>
