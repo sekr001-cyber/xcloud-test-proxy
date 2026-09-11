@@ -17,7 +17,7 @@ body {
   user-select: none;
 }
 
-#game {
+#gameContainer {
   position: relative;
   width: 100vw;
   height: 100vh;
