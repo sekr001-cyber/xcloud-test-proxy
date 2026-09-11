@@ -6,16 +6,40 @@ import { WebSocketServer } from "ws";
 const app = express();
 const server = http.createServer(app);
 
-const PORT = process.env.PORT || 10000;
+const PORT = Number(process.env.PORT) || 10000;
 
-app.use(express.json());
+app.disable("x-powered-by");
+
+app.use(express.json({ limit: "1mb" }));
+
+// ============================================================
+// CONFIG
+// ============================================================
+
+const PROXY_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+  "AppleWebKit/537.36 (KHTML, like Gecko) " +
+  "Chrome/131.0.0.0 Safari/537.36";
+
+const sessions = new Map();
+
+// Keep sessions from growing forever.
+setInterval(() => {
+  const now = Date.now();
+
+  for (const [id, session] of sessions) {
+    if (now - session.lastUsed > 60 * 60 * 1000) {
+      sessions.delete(id);
+    }
+  }
+}, 10 * 60 * 1000);
 
 // ============================================================
 // HELPERS
 // ============================================================
 
 function makeSessionId() {
-  return crypto.randomBytes(16).toString("hex");
+  return crypto.randomBytes(24).toString("hex");
 }
 
 function escapeHtml(value) {
@@ -27,12 +51,67 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
-/*
- * Basic destination safety.
- *
- * This prevents the proxy from being used to access
- * localhost and common private network destinations.
- */
+function getSession(req) {
+  const cookieHeader = req.headers.cookie || "";
+
+  const match = cookieHeader.match(
+    /(?:^|;\s*)proxy_session=([^;]+)/
+  );
+
+  if (!match) {
+    return null;
+  }
+
+  const session = sessions.get(match[1]);
+
+  if (!session) {
+    return null;
+  }
+
+  session.lastUsed = Date.now();
+
+  return session;
+}
+
+function createSession() {
+  const id = makeSessionId();
+
+  sessions.set(id, {
+    cookies: new Map(),
+    lastUsed: Date.now()
+  });
+
+  return id;
+}
+
+// ============================================================
+// DESTINATION SAFETY
+// ============================================================
+
+function isPrivateIPv4(host) {
+  const parts = host.split(".").map(Number);
+
+  if (parts.length !== 4 || parts.some(Number.isNaN)) {
+    return false;
+  }
+
+  const [a, b] = parts;
+
+  if (a === 10) return true;
+
+  if (a === 127) return true;
+
+  if (a === 169 && b === 254) return true;
+
+  if (a === 192 && b === 168) return true;
+
+  if (a === 172 && b >= 16 && b <= 31) {
+    return true;
+  }
+
+  return false;
+}
+
 function isAllowedUrl(value) {
   try {
     const url = new URL(value);
@@ -44,43 +123,76 @@ function isAllowedUrl(value) {
       return false;
     }
 
-    const host = url.hostname.toLowerCase();
+    const host = url.hostname
+      .toLowerCase()
+      .replace(/^\[|\]$/g, "");
 
-    // Localhost
     if (
       host === "localhost" ||
-      host === "127.0.0.1" ||
-      host === "::1" ||
       host.endsWith(".localhost") ||
-      host.endsWith(".local")
+      host.endsWith(".local") ||
+      host === "::1"
     ) {
       return false;
     }
 
-    // 10.0.0.0/8
-    if (host.startsWith("10.")) {
+    if (isPrivateIPv4(host)) {
       return false;
     }
 
-    // 192.168.0.0/16
-    if (host.startsWith("192.168.")) {
+    // IPv6 loopback / private ranges.
+    if (
+      host === "::1" ||
+      host.startsWith("fc") ||
+      host.startsWith("fd") ||
+      host.startsWith("fe80:")
+    ) {
       return false;
-    }
-
-    // 172.16.0.0/12
-    if (host.startsWith("172.")) {
-      const parts = host.split(".");
-      const second = Number(parts[1]);
-
-      if (second >= 16 && second <= 31) {
-        return false;
-      }
     }
 
     return true;
   } catch {
     return false;
   }
+}
+
+// ============================================================
+// COOKIE HANDLING
+// ============================================================
+
+function storeSetCookies(session, setCookieHeaders) {
+  if (!session || !setCookieHeaders) {
+    return;
+  }
+
+  for (const header of setCookieHeaders) {
+    const firstPart = header.split(";")[0];
+
+    const index = firstPart.indexOf("=");
+
+    if (index === -1) {
+      continue;
+    }
+
+    const name = firstPart.slice(0, index).trim();
+    const value = firstPart.slice(index + 1).trim();
+
+    if (!name) {
+      continue;
+    }
+
+    session.cookies.set(name, value);
+  }
+}
+
+function buildCookieHeader(session) {
+  if (!session || session.cookies.size === 0) {
+    return undefined;
+  }
+
+  return [...session.cookies.entries()]
+    .map(([name, value]) => `${name}=${value}`)
+    .join("; ");
 }
 
 // ============================================================
@@ -92,13 +204,13 @@ app.get("/", (req, res) => {
 });
 
 // ============================================================
-// LOGIN
+// LOGIN / SESSION
 // ============================================================
 
 app.get("/login", (req, res) => {
-  const sessionId = makeSessionId();
+  const sessionId = createSession();
 
-  res.cookie("test_session", sessionId, {
+  res.cookie("proxy_session", sessionId, {
     httpOnly: true,
     secure: true,
     sameSite: "lax",
@@ -107,85 +219,61 @@ app.get("/login", (req, res) => {
 
   res.type("html").send(`
 <!doctype html>
-
 <html>
-
 <head>
-  <meta charset="utf-8">
-
-  <meta
-    name="viewport"
-    content="width=device-width, initial-scale=1"
-  >
-
-  <title>VPS Proxy Login</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VPS Proxy Login</title>
 </head>
 
 <body>
 
-  <h1>VPS Proxy</h1>
+<h1>VPS Proxy</h1>
 
-  <p>Session cookie created.</p>
+<p>Proxy session created.</p>
 
-  <p>
-    <a href="/browser">
-      Open Proxy
-    </a>
-  </p>
+<p>
+<a href="/browser">Open Proxy</a>
+</p>
 
-  <p>
-    <a href="/session">
-      Test Session
-    </a>
-  </p>
+<p>
+<a href="/session">Test Session</a>
+</p>
 
 </body>
-
 </html>
   `);
 });
 
-// ============================================================
-// SESSION TEST
-// ============================================================
-
 app.get("/session", (req, res) => {
-  const session = req.headers.cookie || "";
+  const session = getSession(req);
 
-  if (!session.includes("test_session=")) {
+  if (!session) {
     return res.status(401).send(`
 <!doctype html>
-
 <html>
-
 <head>
-  <meta charset="utf-8">
-  <title>Session Error</title>
+<meta charset="utf-8">
+<title>Session Error</title>
 </head>
 
 <body>
 
 <h1>401</h1>
 
-<p>
-No session cookie found.
-</p>
+<p>No proxy session found.</p>
 
 <p>
-<a href="/login">
-Create session
-</a>
+<a href="/login">Create session</a>
 </p>
 
 </body>
-
 </html>
     `);
   }
 
   res.type("html").send(`
 <!doctype html>
-
 <html>
 
 <head>
@@ -194,7 +282,7 @@ Create session
 
 <meta
   name="viewport"
-  content="width=device-width, initial-scale=1"
+  content="width=device-width,initial-scale=1"
 >
 
 <title>Session Test</title>
@@ -206,15 +294,16 @@ Create session
 <h1>Session Test</h1>
 
 <p>
-Session cookie found.
+Proxy session is active.
+</p>
+
+<p>
+Stored upstream cookies:
+${session.cookies.size}
 </p>
 
 <p id="api">
 Testing API...
-</p>
-
-<p id="socket">
-Connecting WebSocket...
 </p>
 
 <script>
@@ -240,84 +329,27 @@ fetch("/api/session")
 
   });
 
-const protocol =
-  location.protocol === "https:"
-    ? "wss:"
-    : "ws:";
-
-const socket =
-  new WebSocket(
-    protocol +
-    "//" +
-    location.host +
-    "/stream"
-  );
-
-socket.onopen = () => {
-
-  document.getElementById("socket")
-    .textContent =
-    "WebSocket: connected";
-
-  socket.send(
-    JSON.stringify({
-      type: "start-stream"
-    })
-  );
-
-};
-
-socket.onmessage = event => {
-
-  console.log(
-    "WebSocket:",
-    event.data
-  );
-
-};
-
-socket.onerror = () => {
-
-  document.getElementById("socket")
-    .textContent =
-    "WebSocket: error";
-
-};
-
-socket.onclose = () => {
-
-  document.getElementById("socket")
-    .textContent =
-    "WebSocket: closed";
-
-};
-
 </script>
 
 </body>
-
 </html>
   `);
 });
 
-// ============================================================
-// API
-// ============================================================
-
 app.get("/api/session", (req, res) => {
-  const cookies = req.headers.cookie || "";
+  const session = getSession(req);
 
-  if (!cookies.includes("test_session=")) {
+  if (!session) {
     return res.status(401).json({
       ok: false,
-      error: "No session cookie"
+      error: "No proxy session"
     });
   }
 
   res.json({
     ok: true,
     authenticated: true,
-    message: "Session cookie successfully received"
+    upstreamCookies: session.cookies.size
   });
 });
 
@@ -337,7 +369,7 @@ app.get("/browser", (req, res) => {
 
 <meta
   name="viewport"
-  content="width=device-width, initial-scale=1"
+  content="width=device-width,initial-scale=1"
 >
 
 <title>VPS Proxy</title>
@@ -363,7 +395,6 @@ body {
     sans-serif;
 
   background: #f5f5f5;
-
 }
 
 .page {
@@ -373,7 +404,6 @@ body {
 
   display: flex;
   flex-direction: column;
-
 }
 
 .home {
@@ -387,19 +417,16 @@ body {
   justify-content: center;
 
   padding: 20px;
-
 }
 
 .logo {
 
   font-size: 58px;
-
   font-weight: bold;
 
   margin-bottom: 30px;
 
   letter-spacing: -3px;
-
 }
 
 .logo span:nth-child(1) {
@@ -428,176 +455,124 @@ body {
 
 .search {
 
-  width:
-    min(700px, 95vw);
+  width: min(700px, 95vw);
 
   display: flex;
 
   gap: 10px;
-
 }
 
 .search input {
 
   flex: 1;
 
-  padding:
-    16px
-    20px;
+  padding: 16px 20px;
 
-  border:
-    1px solid
-    #d0d0d0;
+  border: 1px solid #d0d0d0;
 
-  border-radius:
-    30px;
+  border-radius: 30px;
 
-  font-size:
-    16px;
+  font-size: 16px;
 
   outline: none;
 
   box-shadow:
-    0 2px 8px
-    rgba(0,0,0,.08);
-
+    0 2px 8px rgba(0,0,0,.08);
 }
 
 .search input:focus {
 
-  border-color:
-    #4285f4;
-
+  border-color: #4285f4;
 }
 
 .search button {
 
   border: 0;
 
-  border-radius:
-    25px;
+  border-radius: 25px;
 
-  padding:
-    0 25px;
+  padding: 0 25px;
 
-  background:
-    #4285f4;
+  background: #4285f4;
 
-  color:
-    white;
+  color: white;
 
-  font-size:
-    15px;
+  font-size: 15px;
 
-  cursor:
-    pointer;
-
+  cursor: pointer;
 }
 
 .search button:hover {
 
-  background:
-    #3367d6;
-
+  background: #3367d6;
 }
 
 .info {
 
-  margin-top:
-    20px;
+  margin-top: 20px;
 
-  color:
-    #777;
+  color: #777;
 
-  font-size:
-    13px;
-
+  font-size: 13px;
 }
 
 .toolbar {
 
-  display:
-    none;
+  display: none;
 
-  gap:
-    8px;
+  gap: 8px;
 
-  padding:
-    10px;
+  padding: 10px;
 
-  background:
-    #202124;
-
+  background: #202124;
 }
 
 .toolbar button {
 
-  border:
-    0;
+  border: 0;
 
-  border-radius:
-    5px;
+  border-radius: 5px;
 
-  padding:
-    9px 12px;
+  padding: 9px 12px;
 
-  background:
-    #3c4043;
+  background: #3c4043;
 
-  color:
-    white;
+  color: white;
 
-  cursor:
-    pointer;
-
+  cursor: pointer;
 }
 
 .toolbar button:hover {
 
-  background:
-    #5f6368;
-
+  background: #5f6368;
 }
 
 .address {
 
-  flex:
-    1;
+  flex: 1;
 
-  min-width:
-    0;
+  min-width: 0;
 
-  padding:
-    9px 12px;
+  padding: 9px 12px;
 
-  border:
-    0;
+  border: 0;
 
-  border-radius:
-    5px;
+  border-radius: 5px;
 
-  outline:
-    none;
-
+  outline: none;
 }
 
 .frame {
 
-  display:
-    none;
+  display: none;
 
-  flex:
-    1;
+  flex: 1;
 
-  width:
-    100%;
+  width: 100%;
 
-  border:
-    0;
+  border: 0;
 
-  background:
-    white;
-
+  background: white;
 }
 
 </style>
@@ -653,21 +628,13 @@ body {
     id="toolbar"
   >
 
-    <button onclick="goBack()">
-      ←
-    </button>
+    <button onclick="goBack()">←</button>
 
-    <button onclick="goForward()">
-      →
-    </button>
+    <button onclick="goForward()">→</button>
 
-    <button onclick="reloadPage()">
-      ⟳
-    </button>
+    <button onclick="reloadPage()">⟳</button>
 
-    <button onclick="goHome()">
-      ⌂
-    </button>
+    <button onclick="goHome()">⌂</button>
 
     <input
       id="address"
@@ -722,33 +689,21 @@ let historyPosition = -1;
 
 function normalizeUrl(value) {
 
-  value =
-    value.trim();
+  value = value.trim();
 
   if (!value) {
     return null;
   }
 
-  if (
-    !/^https?:\\/\\//i.test(value)
-  ) {
-
-    value =
-      "https://" +
-      value;
-
+  if (!/^https?:\\/\\//i.test(value)) {
+    value = "https://" + value;
   }
 
   try {
-
     return new URL(value).href;
-
   } catch {
-
     return null;
-
   }
-
 }
 
 function openFromHome(event) {
@@ -756,31 +711,17 @@ function openFromHome(event) {
   event.preventDefault();
 
   const url =
-    normalizeUrl(
-      homeUrl.value
-    );
+    normalizeUrl(homeUrl.value);
 
   if (!url) {
-
-    alert(
-      "Ogiltig URL"
-    );
-
+    alert("Ogiltig URL");
     return;
-
   }
 
-  openPage(
-    url,
-    true
-  );
-
+  openPage(url, true);
 }
 
-function openPage(
-  url,
-  saveHistory
-) {
+function openPage(url, saveHistory) {
 
   if (!url) {
     return;
@@ -800,65 +741,44 @@ function openPage(
 
   }
 
-  home.style.display =
-    "none";
+  home.style.display = "none";
 
-  toolbar.style.display =
-    "flex";
+  toolbar.style.display = "flex";
 
-  frame.style.display =
-    "block";
+  frame.style.display = "block";
 
-  address.value =
-    url;
+  address.value = url;
 
   frame.src =
     "/proxy?url=" +
     encodeURIComponent(url);
-
 }
 
 function navigate() {
 
   const url =
-    normalizeUrl(
-      address.value
-    );
+    normalizeUrl(address.value);
 
   if (!url) {
-
-    alert(
-      "Ogiltig URL"
-    );
-
+    alert("Ogiltig URL");
     return;
-
   }
 
-  openPage(
-    url,
-    true
-  );
-
+  openPage(url, true);
 }
 
 function goBack() {
 
-  if (
-    historyPosition <= 0
-  ) {
+  if (historyPosition <= 0) {
     return;
   }
 
   historyPosition--;
 
   openPage(
-    historyList[
-      historyPosition
-    ],
+    historyList[historyPosition],
     false
   );
-
 }
 
 function goForward() {
@@ -873,56 +793,33 @@ function goForward() {
   historyPosition++;
 
   openPage(
-    historyList[
-      historyPosition
-    ],
+    historyList[historyPosition],
     false
   );
-
 }
 
 function reloadPage() {
 
-  try {
-
-    frame.contentWindow
-      .location
-      .reload();
-
-  } catch {
-
-    frame.src =
-      frame.src;
-
-  }
-
+  frame.src = frame.src;
 }
 
 function goHome() {
 
-  frame.style.display =
-    "none";
+  frame.style.display = "none";
 
-  toolbar.style.display =
-    "none";
+  toolbar.style.display = "none";
 
-  home.style.display =
-    "flex";
+  home.style.display = "flex";
 
   homeUrl.focus();
-
 }
 
 address.addEventListener(
   "keydown",
   event => {
 
-    if (
-      event.key === "Enter"
-    ) {
-
+    if (event.key === "Enter") {
       navigate();
-
     }
 
   }
@@ -946,27 +843,16 @@ app.all("/proxy", async (req, res) => {
     req.query.url;
 
   // ----------------------------------------------------------
-  // CHECK URL
+  // VALIDATE URL
   // ----------------------------------------------------------
 
   if (
     typeof target !== "string" ||
     !target
   ) {
-
     return res.status(400).send(`
 <!doctype html>
-
 <html>
-
-<head>
-
-<meta charset="utf-8">
-
-<title>Proxy Error</title>
-
-</head>
-
 <body>
 
 <h1>400 - Missing URL</h1>
@@ -976,31 +862,14 @@ The proxy did not receive a URL.
 </p>
 
 </body>
-
 </html>
     `);
-
   }
 
-  // ----------------------------------------------------------
-  // SAFETY CHECK
-  // ----------------------------------------------------------
-
   if (!isAllowedUrl(target)) {
-
     return res.status(403).send(`
 <!doctype html>
-
 <html>
-
-<head>
-
-<meta charset="utf-8">
-
-<title>Proxy Error</title>
-
-</head>
-
 <body>
 
 <h1>403 - Destination not allowed</h1>
@@ -1010,26 +879,18 @@ The requested destination is not allowed by this proxy.
 </p>
 
 </body>
-
 </html>
     `);
-
   }
 
   let targetUrl;
 
   try {
-
-    targetUrl =
-      new URL(target);
-
+    targetUrl = new URL(target);
   } catch {
-
     return res.status(400).send(`
 <!doctype html>
-
 <html>
-
 <body>
 
 <h1>400 - Invalid URL</h1>
@@ -1039,14 +900,103 @@ ${escapeHtml(target)}
 </p>
 
 </body>
-
 </html>
     `);
+  }
+
+  // ----------------------------------------------------------
+  // SESSION
+  // ----------------------------------------------------------
+
+  let session = getSession(req);
+
+  if (!session) {
+
+    const sessionId =
+      createSession();
+
+    session =
+      sessions.get(sessionId);
+
+    res.cookie(
+      "proxy_session",
+      sessionId,
+      {
+        httpOnly: true,
+        secure: true,
+        sameSite: "lax",
+        maxAge:
+          60 * 60 * 1000
+      }
+    );
+  }
+
+  // ----------------------------------------------------------
+  // REQUEST HEADERS
+  // ----------------------------------------------------------
+
+  const headers = {
+
+    "User-Agent":
+      PROXY_USER_AGENT,
+
+    "Accept":
+      req.headers.accept ||
+      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+
+    "Accept-Language":
+      req.headers["accept-language"] ||
+      "sv-SE,sv;q=0.9,en-US;q=0.8,en;q=0.7",
+
+    "Cache-Control":
+      req.headers["cache-control"] ||
+      "no-cache"
+  };
+
+  const cookieHeader =
+    buildCookieHeader(session);
+
+  if (cookieHeader) {
+    headers.Cookie = cookieHeader;
+  }
+
+  // ----------------------------------------------------------
+  // BODY
+  // ----------------------------------------------------------
+
+  let body = undefined;
+
+  if (
+    req.method !== "GET" &&
+    req.method !== "HEAD" &&
+    req.body &&
+    typeof req.body === "object"
+  ) {
+
+    const contentType =
+      req.headers["content-type"] ||
+      "";
+
+    if (
+      contentType.includes(
+        "application/json"
+      )
+    ) {
+
+      body =
+        JSON.stringify(req.body);
+
+      headers[
+        "Content-Type"
+      ] =
+        "application/json";
+
+    }
 
   }
 
   // ----------------------------------------------------------
-  // FETCH TARGET
+  // FETCH
   // ----------------------------------------------------------
 
   try {
@@ -1055,37 +1005,24 @@ ${escapeHtml(target)}
     console.log(
       "========================================"
     );
+
     console.log(
       "PROXY REQUEST"
     );
+
     console.log(
       "URL:",
       targetUrl.href
     );
+
     console.log(
       "METHOD:",
       req.method
     );
+
     console.log(
       "========================================"
     );
-
-    const headers = {
-
-      "User-Agent":
-        "School-VPS-Proxy/1.0",
-
-      "Accept":
-        req.headers.accept ||
-        "*/*",
-
-      "Accept-Language":
-        req.headers[
-          "accept-language"
-        ] ||
-        "sv-SE,sv;q=0.9,en;q=0.8"
-
-    };
 
     const response =
       await fetch(
@@ -1096,27 +1033,33 @@ ${escapeHtml(target)}
 
           headers,
 
+          body,
+
           redirect:
-            "manual"
+            "manual",
+
+          signal:
+            AbortSignal.timeout(
+              30000
+            )
         }
       );
 
     // --------------------------------------------------------
-    // RESPONSE INFORMATION
+    // RESPONSE METADATA
     // --------------------------------------------------------
 
     const status =
       response.status;
 
     const statusText =
-      response.statusText ||
-      "";
+      response.statusText || "";
 
     const contentType =
       response.headers.get(
         "content-type"
       ) ||
-      "unknown";
+      "application/octet-stream";
 
     const serverHeader =
       response.headers.get(
@@ -1127,20 +1070,15 @@ ${escapeHtml(target)}
     const locationHeader =
       response.headers.get(
         "location"
-      ) ||
-      null;
+      );
 
-    const retryAfter =
+    const requestId =
       response.headers.get(
-        "retry-after"
+        "cf-ray"
       ) ||
-      null;
-
-    const poweredBy =
       response.headers.get(
-        "x-powered-by"
-      ) ||
-      null;
+        "x-request-id"
+      );
 
     const cacheStatus =
       response.headers.get(
@@ -1148,26 +1086,11 @@ ${escapeHtml(target)}
       ) ||
       response.headers.get(
         "x-cache"
-      ) ||
-      null;
-
-    const requestId =
-      response.headers.get(
-        "x-request-id"
-      ) ||
-      response.headers.get(
-        "cf-ray"
-      ) ||
-      null;
+      );
 
     console.log(
       "STATUS:",
       status
-    );
-
-    console.log(
-      "STATUS TEXT:",
-      statusText
     );
 
     console.log(
@@ -1180,34 +1103,6 @@ ${escapeHtml(target)}
       serverHeader
     );
 
-    if (locationHeader) {
-      console.log(
-        "LOCATION:",
-        locationHeader
-      );
-    }
-
-    if (retryAfter) {
-      console.log(
-        "RETRY-AFTER:",
-        retryAfter
-      );
-    }
-
-    if (poweredBy) {
-      console.log(
-        "X-POWERED-BY:",
-        poweredBy
-      );
-    }
-
-    if (cacheStatus) {
-      console.log(
-        "CACHE STATUS:",
-        cacheStatus
-      );
-    }
-
     if (requestId) {
       console.log(
         "REQUEST ID:",
@@ -1215,9 +1110,91 @@ ${escapeHtml(target)}
       );
     }
 
-    console.log(
-      "========================================"
-    );
+    // --------------------------------------------------------
+    // STORE UPSTREAM COOKIES
+    // --------------------------------------------------------
+
+    try {
+
+      const setCookies =
+        response.headers.getSetCookie();
+
+      if (setCookies.length) {
+
+        storeSetCookies(
+          session,
+          setCookies
+        );
+
+      }
+
+    } catch {
+      // Some environments do not expose
+      // getSetCookie().
+    }
+
+    // --------------------------------------------------------
+    // REDIRECT
+    // --------------------------------------------------------
+
+    if (
+      status >= 300 &&
+      status < 400 &&
+      locationHeader
+    ) {
+
+      let nextUrl;
+
+      try {
+
+        nextUrl =
+          new URL(
+            locationHeader,
+            targetUrl.href
+          ).href;
+
+      } catch {
+
+        return res.status(502).send(`
+<!doctype html>
+<html>
+<body>
+
+<h1>502 - Invalid redirect</h1>
+
+<p>
+The target returned an invalid redirect.
+</p>
+
+</body>
+</html>
+        `);
+      }
+
+      if (!isAllowedUrl(nextUrl)) {
+
+        return res.status(403).send(`
+<!doctype html>
+<html>
+<body>
+
+<h1>403 - Redirect blocked</h1>
+
+<p>
+The target attempted to redirect
+to a blocked destination.
+</p>
+
+</body>
+</html>
+        `);
+      }
+
+      return res.redirect(
+        "/proxy?url=" +
+        encodeURIComponent(nextUrl)
+      );
+    }
 
     // --------------------------------------------------------
     // READ RESPONSE
@@ -1229,99 +1206,13 @@ ${escapeHtml(target)}
       );
 
     // --------------------------------------------------------
-    // REDIRECT
-    // --------------------------------------------------------
-
-    if (
-      status >= 300 &&
-      status < 400
-    ) {
-
-      if (locationHeader) {
-
-        let nextUrl;
-
-        try {
-
-          nextUrl =
-            new URL(
-              locationHeader,
-              targetUrl.href
-            ).href;
-
-        } catch {
-
-          return res.status(502).send(`
-<!doctype html>
-
-<html>
-
-<body>
-
-<h1>502 - Invalid redirect</h1>
-
-<p>
-The destination returned an invalid redirect.
-</p>
-
-</body>
-
-</html>
-          `);
-
-        }
-
-        if (
-          !isAllowedUrl(
-            nextUrl
-          )
-        ) {
-
-          return res.status(403).send(`
-<!doctype html>
-
-<html>
-
-<body>
-
-<h1>403 - Redirect blocked</h1>
-
-<p>
-The destination attempted to redirect
-to a blocked address.
-</p>
-
-</body>
-
-</html>
-          `);
-
-        }
-
-        return res.redirect(
-          "/proxy?url=" +
-          encodeURIComponent(
-            nextUrl
-          )
-        );
-
-      }
-
-    }
-
-    // --------------------------------------------------------
-    // ERROR RESPONSE
+    // TARGET ERROR
     // --------------------------------------------------------
 
     if (status >= 400) {
 
       const rawText =
-        data.toString(
-          "utf8"
-        );
-
-      // Remove scripts/styles before
-      // creating a readable preview.
+        data.toString("utf8");
 
       const preview =
         rawText
@@ -1342,58 +1233,45 @@ to a blocked address.
             " "
           )
           .trim()
-          .slice(
-            0,
-            2000
-          );
+          .slice(0, 2500);
 
       let diagnosis =
-        "Unknown error.";
+        "The target returned an error.";
 
-      if (status === 400) {
-
-        diagnosis =
-          "Bad Request: målservern anser att begäran är felaktig.";
-
-      } else if (status === 401) {
+      if (status === 401) {
 
         diagnosis =
-          "Unauthorized: målservern kräver autentisering.";
+          "The target requires authentication.";
 
       } else if (status === 403) {
 
         diagnosis =
-          "Forbidden: målservern har tagit emot begäran men nekar åtkomst.";
+          "The target received the request but refused access.";
 
       } else if (status === 404) {
 
         diagnosis =
-          "Not Found: den begärda resursen hittades inte.";
+          "The requested resource was not found.";
 
       } else if (status === 408) {
 
         diagnosis =
-          "Request Timeout: målservern väntade för länge.";
-
-      } else if (status === 409) {
-
-        diagnosis =
-          "Conflict: begäran krockar med målserverns aktuella tillstånd.";
+          "The target timed out.";
 
       } else if (status === 429) {
 
         diagnosis =
-          "Too Many Requests: målservern begränsar antalet begäranden.";
+          "The target is rate limiting requests.";
 
       } else if (status >= 500) {
 
         diagnosis =
-          "Server Error: målservern rapporterar ett serverfel.";
-
+          "The target reported a server-side error.";
       }
 
       return res
         .status(status)
+        .type("html")
         .send(`
 <!doctype html>
 
@@ -1418,51 +1296,38 @@ body {
 
   padding: 30px;
 
-  background:
-    #111827;
+  background: #111827;
 
-  color:
-    #e5e7eb;
+  color: #e5e7eb;
 
   font-family:
     Arial,
     sans-serif;
-
 }
 
 .container {
 
-  max-width:
-    900px;
+  max-width: 900px;
 
-  margin:
-    auto;
-
+  margin: auto;
 }
 
 .card {
 
-  background:
-    #1f2937;
+  background: #1f2937;
 
-  border-radius:
-    12px;
+  border-radius: 12px;
 
-  padding:
-    25px;
+  padding: 25px;
 
-  margin-bottom:
-    15px;
-
+  margin-bottom: 15px;
 }
 
 .status {
 
-  font-size:
-    42px;
+  font-size: 42px;
 
-  font-weight:
-    bold;
+  font-weight: bold;
 
   color:
     ${
@@ -1472,59 +1337,37 @@ body {
           ? "#ef4444"
           : "#60a5fa"
     };
-
 }
 
 .label {
 
-  color:
-    #9ca3af;
+  color: #9ca3af;
 
-  font-size:
-    13px;
+  font-size: 13px;
 
-  margin-bottom:
-    5px;
-
+  margin-bottom: 5px;
 }
 
 .value {
 
-  word-break:
-    break-all;
-
+  word-break: break-all;
 }
 
 .preview {
 
-  white-space:
-    pre-wrap;
+  white-space: pre-wrap;
 
-  word-break:
-    break-word;
+  word-break: break-word;
 
-  max-height:
-    350px;
+  max-height: 400px;
 
-  overflow:
-    auto;
+  overflow: auto;
 
-  background:
-    #030712;
+  background: #030712;
 
-  padding:
-    15px;
+  padding: 15px;
 
-  border-radius:
-    6px;
-
-}
-
-code {
-
-  word-break:
-    break-all;
-
+  border-radius: 6px;
 }
 
 </style>
@@ -1549,9 +1392,7 @@ ${escapeHtml(
 </h2>
 
 <p>
-${escapeHtml(
-  diagnosis
-)}
+${escapeHtml(diagnosis)}
 </p>
 
 </div>
@@ -1559,13 +1400,11 @@ ${escapeHtml(
 <div class="card">
 
 <div class="label">
-URL
+Requested URL
 </div>
 
 <div class="value">
-${escapeHtml(
-  targetUrl.href
-)}
+${escapeHtml(targetUrl.href)}
 </div>
 
 </div>
@@ -1577,9 +1416,7 @@ Content-Type
 </div>
 
 <div class="value">
-${escapeHtml(
-  contentType
-)}
+${escapeHtml(contentType)}
 </div>
 
 </div>
@@ -1591,93 +1428,42 @@ Server
 </div>
 
 <div class="value">
-${escapeHtml(
-  serverHeader
-)}
+${escapeHtml(serverHeader)}
 </div>
 
 </div>
-
-${
-  locationHeader
-    ? `
-<div class="card">
-<div class="label">
-Location
-</div>
-<div class="value">
-${escapeHtml(
-  locationHeader
-)}
-</div>
-</div>
-`
-    : ""
-}
-
-${
-  retryAfter
-    ? `
-<div class="card">
-<div class="label">
-Retry-After
-</div>
-<div class="value">
-${escapeHtml(
-  retryAfter
-)}
-</div>
-</div>
-`
-    : ""
-}
-
-${
-  poweredBy
-    ? `
-<div class="card">
-<div class="label">
-X-Powered-By
-</div>
-<div class="value">
-${escapeHtml(
-  poweredBy
-)}
-</div>
-</div>
-`
-    : ""
-}
-
-${
-  cacheStatus
-    ? `
-<div class="card">
-<div class="label">
-Cache / CDN status
-</div>
-<div class="value">
-${escapeHtml(
-  cacheStatus
-)}
-</div>
-</div>
-`
-    : ""
-}
 
 ${
   requestId
     ? `
 <div class="card">
+
 <div class="label">
 Request / CDN ID
 </div>
+
 <div class="value">
-${escapeHtml(
-  requestId
-)}
+${escapeHtml(requestId)}
 </div>
+
+</div>
+`
+    : ""
+}
+
+${
+  cacheStatus
+    ? `
+<div class="card">
+
+<div class="label">
+CDN / Cache status
+</div>
+
+<div class="value">
+${escapeHtml(cacheStatus)}
+</div>
+
 </div>
 `
     : ""
@@ -1692,7 +1478,7 @@ Response preview
 <div class="preview">
 ${escapeHtml(
   preview ||
-  "Målservern skickade ingen läsbar response body."
+  "No readable response body."
 )}
 </div>
 
@@ -1704,36 +1490,29 @@ ${escapeHtml(
 
 </html>
         `);
-
     }
 
     // --------------------------------------------------------
-    // NORMAL HTML RESPONSE
+    // HTML
     // --------------------------------------------------------
 
     if (
-      contentType.includes(
-        "text/html"
-      )
+      contentType
+        .toLowerCase()
+        .includes("text/html")
     ) {
 
       let html =
-        data.toString(
-          "utf8"
-        );
+        data.toString("utf8");
 
-      // Remove CSP meta tags from
-      // the returned document.
-
+      // Remove CSP meta tags.
       html =
         html.replace(
           /<meta[^>]+http-equiv=["']Content-Security-Policy["'][^>]*>/gi,
           ""
         );
 
-      // Rewrite normal href/src/action
-      // links so they go through /proxy.
-
+      // Rewrite URLs in href/src/action.
       html =
         html.replace(
           /(\s(?:href|src|action)=["'])([^"']+)(["'])/gi,
@@ -1748,11 +1527,10 @@ ${escapeHtml(
               value.startsWith("#") ||
               value.startsWith("data:") ||
               value.startsWith("javascript:") ||
-              value.startsWith("mailto:")
+              value.startsWith("mailto:") ||
+              value.startsWith("tel:")
             ) {
-
               return match;
-
             }
 
             try {
@@ -1764,16 +1542,11 @@ ${escapeHtml(
                 ).href;
 
               if (
-                !absolute.startsWith(
-                  "http://"
-                ) &&
-                !absolute.startsWith(
-                  "https://"
+                !isAllowedUrl(
+                  absolute
                 )
               ) {
-
                 return match;
-
               }
 
               return (
@@ -1788,14 +1561,11 @@ ${escapeHtml(
             } catch {
 
               return match;
-
             }
-
           }
         );
 
-      // Rewrite srcset images.
-
+      // Rewrite srcset.
       html =
         html.replace(
           /(\ssrcset=["'])([^"']+)(["'])/gi,
@@ -1816,9 +1586,7 @@ ${escapeHtml(
                       .trim()
                       .split(/\s+/);
 
-                  if (
-                    !parts[0]
-                  ) {
+                  if (!parts[0]) {
                     return item;
                   }
 
@@ -1830,20 +1598,25 @@ ${escapeHtml(
                         targetUrl.href
                       ).href;
 
+                    if (
+                      !isAllowedUrl(
+                        absolute
+                      )
+                    ) {
+                      return item;
+                    }
+
                     parts[0] =
                       "/proxy?url=" +
                       encodeURIComponent(
                         absolute
                       );
 
-                    return parts.join(
-                      " "
-                    );
+                    return parts.join(" ");
 
                   } catch {
 
                     return item;
-
                   }
 
                 })
@@ -1854,18 +1627,69 @@ ${escapeHtml(
               rewritten +
               end
             );
-
           }
         );
 
-      res.status(status);
+      // Rewrite <base href>.
+      html =
+        html.replace(
+          /<base\s+href=["']([^"']+)["'][^>]*>/gi,
+          (
+            match,
+            value
+          ) => {
+
+            try {
+
+              const absolute =
+                new URL(
+                  value,
+                  targetUrl.href
+                ).href;
+
+              return `
+<base href="/proxy?url=${encodeURIComponent(
+                absolute
+              )}">
+              `;
+
+            } catch {
+
+              return match;
+            }
+          }
+        );
+
+      // Do not allow the target to escape
+      // the proxy with a normal top-level form.
+      html =
+        html.replace(
+          /target=["']_top["']/gi,
+          'target="_self"'
+        );
+
+      // Response headers that commonly
+      // interfere with embedding.
+      res.removeHeader(
+        "Content-Security-Policy"
+      );
+
+      res.removeHeader(
+        "X-Frame-Options"
+      );
+
+      res.removeHeader(
+        "Content-Encoding"
+      );
 
       res.set(
         "Content-Type",
         "text/html; charset=utf-8"
       );
 
-      return res.send(html);
+      return res
+        .status(status)
+        .send(html);
     }
 
     // --------------------------------------------------------
@@ -1878,8 +1702,11 @@ ${escapeHtml(
         "Content-Type",
         contentType
       );
-
     }
+
+    // Do not forward upstream
+    // Content-Encoding because fetch()
+    // may already have decoded the body.
 
     return res
       .status(status)
@@ -1891,17 +1718,29 @@ ${escapeHtml(
     console.error(
       "========================================"
     );
+
     console.error(
       "PROXY INTERNAL ERROR"
     );
+
     console.error(
       error
     );
+
     console.error(
       "========================================"
     );
 
-    return res.status(502).send(`
+    const message =
+      error?.name === "TimeoutError"
+        ? "The target request timed out."
+        : error?.message ||
+          "Unknown proxy error.";
+
+    return res
+      .status(502)
+      .type("html")
+      .send(`
 <!doctype html>
 
 <html>
@@ -1910,40 +1749,34 @@ ${escapeHtml(
 
 <meta charset="utf-8">
 
-<title>Proxy Internal Error</title>
+<title>Proxy Error</title>
 
 </head>
 
 <body>
 
 <h1>
-502 - Proxy Internal Error
+502 - Proxy Error
 </h1>
 
 <p>
-Proxyservern kunde inte slutföra begäran.
+The proxy could not complete the request.
 </p>
 
-<h3>Error</h3>
-
 <pre>
-${escapeHtml(
-  error.stack ||
-  error.message ||
-  String(error)
-)}
+${escapeHtml(message)}
 </pre>
 
 </body>
 
 </html>
-    `);
+      `);
   }
 
 });
 
 // ============================================================
-// WEBSOCKET STREAM
+// WEBSOCKET
 // ============================================================
 
 const wss =
@@ -1957,14 +1790,12 @@ wss.on(
   socket => {
 
     console.log(
-      "Streaming client connected"
+      "WebSocket client connected"
     );
 
     socket.send(
       JSON.stringify({
-        type:
-          "connected",
-
+        type: "connected",
         message:
           "Streaming session established"
       })
@@ -1973,70 +1804,56 @@ wss.on(
     let packetNumber = 0;
 
     const interval =
-      setInterval(
-        () => {
+      setInterval(() => {
 
-          if (
-            socket.readyState !== 1
-          ) {
+        if (
+          socket.readyState !== 1
+        ) {
 
-            clearInterval(
-              interval
-            );
+          clearInterval(interval);
 
-            return;
-          }
+          return;
+        }
 
-          packetNumber++;
+        packetNumber++;
 
-          const packet =
-            Buffer.alloc(
-              1024
-            );
+        const packet =
+          Buffer.alloc(1024);
 
-          packet.writeUInt32BE(
-            packetNumber,
-            0
-          );
+        packet.writeUInt32BE(
+          packetNumber,
+          0
+        );
 
-          for (
-            let i = 4;
-            i < packet.length;
-            i++
-          ) {
+        for (
+          let i = 4;
+          i < packet.length;
+          i++
+        ) {
 
-            packet[i] =
-              (
-                packetNumber +
-                i
-              ) % 256;
+          packet[i] =
+            (packetNumber + i) % 256;
 
-          }
+        }
+
+        socket.send(packet);
+
+        if (
+          packetNumber >= 30
+        ) {
+
+          clearInterval(interval);
 
           socket.send(
-            packet
+            JSON.stringify({
+              type:
+                "stream-complete"
+            })
           );
 
-          if (
-            packetNumber >= 30
-          ) {
+        }
 
-            clearInterval(
-              interval
-            );
-
-            socket.send(
-              JSON.stringify({
-                type:
-                  "stream-complete"
-              })
-            );
-
-          }
-
-        },
-        250
-      );
+      }, 250);
 
     socket.on(
       "message",
@@ -2054,12 +1871,10 @@ wss.on(
       "close",
       () => {
 
-        clearInterval(
-          interval
-        );
+        clearInterval(interval);
 
         console.log(
-          "Streaming client disconnected"
+          "WebSocket client disconnected"
         );
 
       }
@@ -2078,23 +1893,19 @@ app.get(
 
     res.json({
 
-      ok:
-        true,
+      ok: true,
 
-      http:
-        true,
+      http: true,
 
-      websocket:
-        true,
+      websocket: true,
 
-      streaming:
-        true,
+      streaming: true,
 
-      browser:
-        true,
+      browser: true,
 
-      proxy:
-        true
+      proxy: true,
+
+      sessions: sessions.size
 
     });
 
@@ -2124,15 +1935,18 @@ server.listen(
     );
 
     console.log(
-      "Browser: /browser"
+      "Browser:",
+      "/browser"
     );
 
     console.log(
-      "Proxy: /proxy?url=https://example.com"
+      "Proxy:",
+      "/proxy?url=https://example.com"
     );
 
     console.log(
-      "Health: /health"
+      "Health:",
+      "/health"
     );
 
     console.log(
