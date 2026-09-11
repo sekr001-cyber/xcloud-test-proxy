@@ -1,12 +1,17 @@
 {
-  "name": "vps-proxy-school-project",
+  "name": "vps-proxy",
   "version": "1.0.0",
+  "description": "VPS proxy and streaming test server",
   "type": "module",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
+    "cookie": "^1.0.2",
     "express": "^5.1.0",
-    "ws": "^8.18.3"
+    "ws": "^8.18.0"
   }
 }
