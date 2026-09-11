@@ -1,58 +1,34 @@
 import express from "express";
 import http from "http";
 import crypto from "crypto";
-import dns from "dns/promises";
-import net from "net";
+import dns from "dns";
+import dnsPromises from "dns/promises";
 import { WebSocketServer } from "ws";
-import { parse as parseCookie } from "cookie";
+
+dns.setDefaultResultOrder("ipv4first");
 
 const app = express();
 const server = http.createServer(app);
+const wss = new WebSocketServer({ noServer: true });
 
 const PORT = Number(process.env.PORT || 10000);
+
 const PROXY_KEY = process.env.PROXY_KEY || "";
-const REQUEST_TIMEOUT = Number(process.env.REQUEST_TIMEOUT || 30000);
-const MAX_BODY_SIZE = Number(
-  process.env.MAX_BODY_SIZE || 10 * 1024 * 1024
-);
-
-const ALLOWLIST = (process.env.PROXY_ALLOWLIST || "")
-  .split(",")
-  .map((x) => x.trim().toLowerCase())
-  .filter(Boolean);
-
-const UPSTREAM_USER_AGENT =
-  process.env.PROXY_USER_AGENT ||
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-  "AppleWebKit/537.36 (KHTML, like Gecko) " +
-  "Chrome/140.0.0.0 Safari/537.36";
 
 const sessions = new Map();
 
-app.disable("x-powered-by");
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 
-app.use(
-  express.json({
-    limit: `${Math.ceil(MAX_BODY_SIZE / 1024 / 1024)}mb`,
-  })
-);
+/* -------------------------------------------------------
+   Basic helpers
+------------------------------------------------------- */
 
-app.use(
-  express.urlencoded({
-    extended: true,
-    limit: `${Math.ceil(MAX_BODY_SIZE / 1024 / 1024)}mb`,
-  })
-);
-
-/* =========================================================
-   UTILITIES
-   ========================================================= */
-
-function randomId(bytes = 18) {
+function makeId(bytes = 24) {
   return crypto.randomBytes(bytes).toString("hex");
 }
 
-function escapeHtml(value) {
+function escapeHtml(value = "") {
   return String(value)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
@@ -61,52 +37,45 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
-function getSessionId(req) {
-  const cookies = parseCookie(req.headers.cookie || "");
-  return cookies.proxy_session || null;
+function getProxyKey(req) {
+  return (
+    req.headers["x-proxy-key"] ||
+    req.query.key ||
+    req.body?.key ||
+    ""
+  );
 }
 
-function getOrCreateSession(req, res) {
-  let id = getSessionId(req);
+function requireProxyKey(req, res, next) {
+  if (!PROXY_KEY) return next();
 
-  if (!id || !sessions.has(id)) {
-    id = randomId();
-
-    sessions.set(id, {
-      cookies: new Map(),
-      createdAt: Date.now(),
-      lastUsed: Date.now(),
-    });
-
-    res.cookie("proxy_session", id, {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: false,
-      maxAge: 24 * 60 * 60 * 1000,
+  if (getProxyKey(req) !== PROXY_KEY) {
+    return res.status(401).json({
+      error: "Unauthorized",
+      message: "A valid proxy key is required."
     });
   }
 
-  const session = sessions.get(id);
-  session.lastUsed = Date.now();
-
-  return session;
+  next();
 }
 
-function cleanupSessions() {
-  const now = Date.now();
+function normalizeInput(input) {
+  input = String(input || "").trim();
 
-  for (const [id, session] of sessions) {
-    if (now - session.lastUsed > 24 * 60 * 60 * 1000) {
-      sessions.delete(id);
-    }
+  if (!input) return null;
+
+  if (/^https?:\/\//i.test(input)) {
+    return input;
   }
+
+  if (
+    /^[a-z0-9.-]+\.[a-z]{2,}(\/.*)?$/i.test(input)
+  ) {
+    return `https://${input}`;
+  }
+
+  return `https://duckduckgo.com/?q=${encodeURIComponent(input)}&kl=se-sv`;
 }
-
-setInterval(cleanupSessions, 60 * 60 * 1000).unref();
-
-/* =========================================================
-   SSRF PROTECTION
-   ========================================================= */
 
 function isPrivateIPv4(ip) {
   const parts = ip.split(".").map(Number);
@@ -117,603 +86,201 @@ function isPrivateIPv4(ip) {
 
   const [a, b] = parts;
 
-  return (
-    a === 0 ||
-    a === 10 ||
-    a === 127 ||
-    (a === 100 && b >= 64 && b <= 127) ||
-    (a === 169 && b === 254) ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168)
-  );
-}
-
-function isPrivateIPv6(ip) {
-  const normalized = ip.toLowerCase();
-
-  return (
-    normalized === "::" ||
-    normalized === "::1" ||
-    normalized.startsWith("fc") ||
-    normalized.startsWith("fd") ||
-    normalized.startsWith("fe8") ||
-    normalized.startsWith("fe9") ||
-    normalized.startsWith("fea") ||
-    normalized.startsWith("feb")
-  );
-}
-
-function isPrivateAddress(address) {
-  const family = net.isIP(address);
-
-  if (family === 4) {
-    return isPrivateIPv4(address);
-  }
-
-  if (family === 6) {
-    return isPrivateIPv6(address);
-  }
+  if (a === 10) return true;
+  if (a === 127) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
 
   return false;
 }
 
-function hostnameAllowed(hostname) {
-  const host = hostname.toLowerCase().replace(/\.$/, "");
+function isPrivateIPv6(ip) {
+  const value = ip.toLowerCase();
 
-  if (ALLOWLIST.length === 0) {
-    return true;
-  }
+  if (value === "::1") return true;
+  if (value.startsWith("fc")) return true;
+  if (value.startsWith("fd")) return true;
+  if (value.startsWith("fe80:")) return true;
 
-  return ALLOWLIST.some(
-    (allowed) =>
-      host === allowed ||
-      host.endsWith(`.${allowed}`)
-  );
+  return false;
 }
 
-async function validateDestination(url) {
-  let parsed;
+function isBlockedAddress(ip) {
+  return isPrivateIPv4(ip) || isPrivateIPv6(ip);
+}
+
+function getAllowedHosts() {
+  if (!process.env.PROXY_ALLOWLIST) return null;
+
+  return process.env.PROXY_ALLOWLIST
+    .split(",")
+    .map(x => x.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+async function validateDestination(targetUrl) {
+  let url;
 
   try {
-    parsed = new URL(url);
+    url = new URL(targetUrl);
   } catch {
-    throw new Error("Invalid URL");
+    throw new Error("Invalid destination URL.");
   }
 
-  if (!["http:", "https:"].includes(parsed.protocol)) {
-    throw new Error(
-      "Only HTTP and HTTPS destinations are supported"
-    );
+  if (!["http:", "https:"].includes(url.protocol)) {
+    throw new Error("Only HTTP and HTTPS URLs are supported.");
   }
 
-  if (parsed.username || parsed.password) {
-    throw new Error(
-      "URLs containing credentials are not allowed"
-    );
-  }
-
-  const hostname = parsed.hostname
-    .toLowerCase()
-    .replace(/\.$/, "");
-
-  if (!hostnameAllowed(hostname)) {
-    throw new Error(
-      "Destination is not on the proxy allowlist"
-    );
-  }
+  const hostname = url.hostname.toLowerCase();
 
   if (
     hostname === "localhost" ||
     hostname.endsWith(".localhost") ||
     hostname.endsWith(".local") ||
-    hostname === "ip6-localhost"
+    hostname === "0.0.0.0"
   ) {
-    throw new Error(
-      "Local destinations are blocked"
-    );
+    throw new Error("Local destinations are blocked.");
   }
 
-  if (net.isIP(hostname)) {
-    if (isPrivateAddress(hostname)) {
-      throw new Error(
-        "Private/internal destinations are blocked"
-      );
-    }
+  const allowlist = getAllowedHosts();
 
-    return parsed;
-  }
-
-  let addresses;
-
-  try {
-    addresses = await dns.lookup(hostname, {
-      all: true,
-      verbatim: true,
+  if (allowlist && allowlist.length > 0) {
+    const allowed = allowlist.some(host => {
+      return hostname === host || hostname.endsWith(`.${host}`);
     });
-  } catch {
-    throw new Error(
-      "Unable to resolve destination hostname"
-    );
+
+    if (!allowed) {
+      throw new Error("Destination is not on the proxy allowlist.");
+    }
   }
+
+  const addresses = await dnsPromises.lookup(hostname, {
+    all: true,
+    verbatim: false
+  });
 
   if (!addresses.length) {
-    throw new Error(
-      "Destination hostname did not resolve"
-    );
+    throw new Error("Destination hostname did not resolve.");
   }
 
   for (const address of addresses) {
-    if (isPrivateAddress(address.address)) {
+    if (isBlockedAddress(address.address)) {
       throw new Error(
-        "Destination resolves to a private/internal address"
+        "Destination resolves to a private or local IP address."
       );
     }
   }
 
-  return parsed;
+  return url;
 }
 
-/* =========================================================
-   REQUEST HEADERS / COOKIES
-   ========================================================= */
+/* -------------------------------------------------------
+   Session handling
+------------------------------------------------------- */
 
-function getForwardHeaders(req, session) {
-  const headers = new Headers();
+function createProxySession() {
+  const id = makeId();
 
-  const allowedHeaders = [
-    "accept",
-    "accept-language",
-    "cache-control",
-    "content-type",
-    "if-match",
-    "if-modified-since",
-    "if-none-match",
-    "if-unmodified-since",
-    "pragma",
-    "range",
-    "referer",
-    "user-agent",
-  ];
+  sessions.set(id, {
+    createdAt: Date.now(),
+    cookies: new Map()
+  });
 
-  for (const name of allowedHeaders) {
-    const value = req.headers[name];
+  return id;
+}
 
-    if (value) {
-      headers.set(
-        name,
-        Array.isArray(value)
-          ? value.join(", ")
-          : value
-      );
-    }
+function getSession(req, res) {
+  let id = req.cookies?.proxy_session;
+
+  if (!id || !sessions.has(id)) {
+    id = createProxySession();
+
+    res.cookie("proxy_session", id, {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: false,
+      maxAge: 24 * 60 * 60 * 1000
+    });
   }
 
-  headers.set(
-    "user-agent",
-    UPSTREAM_USER_AGENT
-  );
+  return sessions.get(id);
+}
 
-  if (!headers.has("accept")) {
-    headers.set(
-      "accept",
-      "text/html,application/xhtml+xml,application/xml;" +
-        "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
-    );
-  }
-
-  if (!headers.has("accept-language")) {
-    headers.set(
-      "accept-language",
-      "en-US,en;q=0.9"
-    );
-  }
-
-  const cookies = [...session.cookies.entries()]
+function buildCookieHeader(session) {
+  return [...session.cookies.entries()]
     .map(([name, value]) => `${name}=${value}`)
     .join("; ");
-
-  if (cookies) {
-    headers.set("cookie", cookies);
-  }
-
-  headers.delete("host");
-
-  for (const name of [
-    "connection",
-    "proxy-connection",
-    "keep-alive",
-    "transfer-encoding",
-    "upgrade",
-    "te",
-    "trailer",
-  ]) {
-    headers.delete(name);
-  }
-
-  return headers;
 }
 
-function storeUpstreamCookies(response, session) {
-  if (
-    typeof response.headers.getSetCookie !==
-    "function"
-  ) {
-    return;
+function storeSetCookie(session, setCookieHeaders) {
+  if (!setCookieHeaders) return;
+
+  for (const line of setCookieHeaders) {
+    const firstPart = line.split(";")[0];
+    const index = firstPart.indexOf("=");
+
+    if (index === -1) continue;
+
+    const name = firstPart.slice(0, index).trim();
+    const value = firstPart.slice(index + 1).trim();
+
+    if (!name) continue;
+
+    session.cookies.set(name, value);
   }
+}
 
-  const cookies =
-    response.headers.getSetCookie();
+/* -------------------------------------------------------
+   Cookie parser middleware
+------------------------------------------------------- */
 
-  for (const rawCookie of cookies) {
-    const firstPart = rawCookie.split(";")[0];
-    const separator = firstPart.indexOf("=");
+app.use((req, _res, next) => {
+  const header = req.headers.cookie || "";
+  const cookies = {};
 
-    if (separator === -1) {
-      continue;
-    }
+  for (const item of header.split(";")) {
+    const index = item.indexOf("=");
 
-    const name = firstPart
-      .slice(0, separator)
-      .trim();
+    if (index === -1) continue;
 
-    const value = firstPart
-      .slice(separator + 1)
-      .trim();
+    const name = item.slice(0, index).trim();
+    const value = item.slice(index + 1).trim();
 
     if (name) {
-      session.cookies.set(name, value);
-    }
-  }
-}
-
-/* =========================================================
-   PROXY HELPERS
-   ========================================================= */
-
-function makeProxyUrl(url) {
-  return `/proxy?url=${encodeURIComponent(url)}`;
-}
-
-function getRequestBody(req) {
-  if (
-    req.method === "GET" ||
-    req.method === "HEAD"
-  ) {
-    return undefined;
-  }
-
-  if (
-    req.body === undefined ||
-    req.body === null
-  ) {
-    return undefined;
-  }
-
-  const contentType = String(
-    req.headers["content-type"] || ""
-  );
-
-  if (
-    contentType.includes("application/json")
-  ) {
-    return JSON.stringify(req.body);
-  }
-
-  if (
-    contentType.includes(
-      "application/x-www-form-urlencoded"
-    )
-  ) {
-    return new URLSearchParams(req.body).toString();
-  }
-
-  if (typeof req.body === "string") {
-    return req.body;
-  }
-
-  return JSON.stringify(req.body);
-}
-
-function copyResponseHeaders(upstream, res) {
-  const blocked = new Set([
-    "content-length",
-    "content-encoding",
-    "transfer-encoding",
-    "connection",
-    "keep-alive",
-    "upgrade",
-    "content-security-policy",
-    "content-security-policy-report-only",
-    "x-frame-options",
-  ]);
-
-  for (const [name, value] of upstream.headers.entries()) {
-    if (!blocked.has(name.toLowerCase())) {
-      res.setHeader(name, value);
+      cookies[name] = decodeURIComponent(value);
     }
   }
 
-  for (const header of [
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-  ]) {
-    res.removeHeader(header);
-  }
-}
+  req.cookies = cookies;
 
-function checkProxyKey(req, res) {
-  if (!PROXY_KEY) {
-    return true;
-  }
+  next();
+});
 
-  const supplied =
-    req.headers["x-proxy-key"] ||
-    req.query.key ||
-    "";
+/* -------------------------------------------------------
+   Homepage
+------------------------------------------------------- */
 
-  if (supplied !== PROXY_KEY) {
-    res.status(401).json({
-      error: "Unauthorized",
-      message:
-        "A valid proxy key is required.",
-    });
-
-    return false;
-  }
-
-  return true;
-}
-
-/* =========================================================
-   HTML REWRITING
-   ========================================================= */
-
-function rewriteHtml(html, baseUrl) {
-  html = html.replace(
-    /<meta\b[^>]*http-equiv\s*=\s*["']content-security-policy["'][^>]*>/gi,
-    ""
-  );
-
-  html = html.replace(
-    /<meta\b[^>]*http-equiv\s*=\s*["']content-security-policy-report-only["'][^>]*>/gi,
-    ""
-  );
-
-  function rewriteUrl(value) {
-    const trimmed = value.trim();
-
-    if (
-      !trimmed ||
-      trimmed.startsWith("#") ||
-      trimmed.startsWith("data:") ||
-      trimmed.startsWith("blob:") ||
-      trimmed.startsWith("javascript:") ||
-      trimmed.startsWith("mailto:") ||
-      trimmed.startsWith("tel:")
-    ) {
-      return value;
-    }
-
-    try {
-      const absolute = new URL(
-        trimmed,
-        baseUrl
-      );
-
-      if (
-        !["http:", "https:"].includes(
-          absolute.protocol
-        )
-      ) {
-        return value;
-      }
-
-      return makeProxyUrl(
-        absolute.href
-      );
-    } catch {
-      return value;
-    }
-  }
-
-  html = html.replace(
-    /(\b(?:href|src|action|poster)\s*=\s*)(["'])([^"']+)\2/gi,
-    (match, prefix, quote, value) => {
-      return (
-        prefix +
-        quote +
-        rewriteUrl(value) +
-        quote
-      );
-    }
-  );
-
-  html = html.replace(
-    /\b(srcset\s*=\s*)(["'])([^"']+)\2/gi,
-    (match, prefix, quote, value) => {
-      const rewritten = value
-        .split(",")
-        .map((part) => {
-          const pieces = part
-            .trim()
-            .split(/\s+/);
-
-          const source = pieces.shift();
-
-          if (!source) {
-            return part;
-          }
-
-          const newSource =
-            rewriteUrl(source);
-
-          return [
-            newSource,
-            ...pieces,
-          ].join(" ");
-        })
-        .join(", ");
-
-      return (
-        prefix +
-        quote +
-        rewritten +
-        quote
-      );
-    }
-  );
-
-  html = html.replace(
-    /(<base\b[^>]*\bhref\s*=\s*)(["'])([^"']+)\2/gi,
-    (match, prefix, quote, value) => {
-      try {
-        const absolute = new URL(
-          value,
-          baseUrl
-        );
-
-        return (
-          prefix +
-          quote +
-          makeProxyUrl(
-            absolute.href
-          ) +
-          quote
-        );
-      } catch {
-        return match;
-      }
-    }
-  );
-
-  return html;
-}
-
-/* =========================================================
-   HOME
-   ========================================================= */
-
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
   res.redirect("/browser");
 });
 
-/* =========================================================
-   LOGIN / SESSION
-   ========================================================= */
+/* -------------------------------------------------------
+   Browser start page
+------------------------------------------------------- */
 
-app.get("/login", (req, res) => {
-  getOrCreateSession(req, res);
+app.get("/browser", (_req, res) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
 
-  res.send(`
-<!doctype html>
-<html>
+  res.send(`<!doctype html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Proxy Session</title>
-<style>
-body {
-  font-family: Arial, sans-serif;
-  max-width: 800px;
-  margin: 50px auto;
-  padding: 20px;
-  background: #f5f5f5;
-}
-.box {
-  background: white;
-  padding: 25px;
-  border-radius: 12px;
-  box-shadow: 0 4px 20px rgba(0,0,0,.08);
-}
-a {
-  color: #1769ff;
-}
-</style>
-</head>
-<body>
-<div class="box">
-<h1>Proxy session</h1>
-<p>Your proxy session has been created.</p>
-<p><a href="/browser">Open browser</a></p>
-<p><a href="/session">View session</a></p>
-</div>
-</body>
-</html>
-`);
-});
+<meta name="viewport" content="width=device-width, initial-scale=1">
 
-app.get("/session", (req, res) => {
-  const sessionId = getSessionId(req);
-
-  if (
-    !sessionId ||
-    !sessions.has(sessionId)
-  ) {
-    return res.status(401).json({
-      authenticated: false,
-    });
-  }
-
-  const session = sessions.get(
-    sessionId
-  );
-
-  res.json({
-    authenticated: true,
-    createdAt: new Date(
-      session.createdAt
-    ).toISOString(),
-    lastUsed: new Date(
-      session.lastUsed
-    ).toISOString(),
-    upstreamCookies:
-      session.cookies.size,
-  });
-});
-
-app.get("/api/session", (req, res) => {
-  const sessionId = getSessionId(req);
-
-  if (
-    !sessionId ||
-    !sessions.has(sessionId)
-  ) {
-    return res.status(401).json({
-      authenticated: false,
-    });
-  }
-
-  res.json({
-    authenticated: true,
-  });
-});
-
-/* =========================================================
-   PROXY BROWSER
-   ========================================================= */
-
-app.get("/browser", (req, res) => {
-  res.send(`
-<!doctype html>
-<html>
-<head>
-
-<meta charset="utf-8">
-
-<meta
-  name="viewport"
-  content="width=device-width,initial-scale=1"
->
-
-<title>XCloud Browser</title>
+<title>Web Gateway</title>
 
 <style>
-
 * {
   box-sizing: border-box;
 }
@@ -723,743 +290,982 @@ body {
   margin: 0;
   width: 100%;
   height: 100%;
-  overflow: hidden;
-  font-family: Arial, sans-serif;
-  background: #111;
-  color: white;
+  font-family: Arial, Helvetica, sans-serif;
+  background: #f4f4f5;
 }
 
-.toolbar {
-  height: 62px;
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  height: 64px;
+  background: #111827;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 10px;
-  background: #181818;
-  border-bottom: 1px solid #333;
+  gap: 12px;
+  padding: 10px 16px;
 }
 
-button {
-  height: 40px;
-  padding: 0 14px;
+.logo {
+  color: white;
+  font-size: 20px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.search {
+  flex: 1;
+  display: flex;
+  gap: 8px;
+}
+
+.search input {
+  width: 100%;
+  height: 42px;
   border: 0;
   border-radius: 8px;
-  background: #303030;
-  color: white;
-  cursor: pointer;
-  font-size: 14px;
-}
-
-button:hover {
-  background: #414141;
-}
-
-form {
-  display: flex;
-  flex: 1;
-  gap: 8px;
-}
-
-input {
-  flex: 1;
-  min-width: 0;
-  height: 40px;
-  border: 1px solid #444;
-  border-radius: 8px;
-  background: #101010;
-  color: white;
   padding: 0 14px;
   font-size: 15px;
   outline: none;
 }
 
-input:focus {
-  border-color: #777;
+.search button {
+  border: 0;
+  background: #f97316;
+  color: white;
+  padding: 0 18px;
+  border-radius: 8px;
+  font-weight: 700;
+  cursor: pointer;
 }
 
-iframe {
-  display: block;
+.search button:hover {
+  background: #ea580c;
+}
+
+.home {
+  height: calc(100vh - 64px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 30px;
+}
+
+.card {
+  width: min(760px, 100%);
+  text-align: center;
+}
+
+.ddg {
+  font-size: 48px;
+  font-weight: 800;
+  color: #111827;
+  margin-bottom: 10px;
+}
+
+.subtitle {
+  color: #6b7280;
+  margin-bottom: 28px;
+}
+
+.bigsearch {
+  display: flex;
+  gap: 10px;
+}
+
+.bigsearch input {
+  flex: 1;
+  height: 52px;
+  border: 1px solid #d1d5db;
+  border-radius: 12px;
+  padding: 0 18px;
+  font-size: 17px;
+  outline: none;
+}
+
+.bigsearch input:focus {
+  border-color: #f97316;
+}
+
+.bigsearch button {
+  border: 0;
+  border-radius: 12px;
+  padding: 0 24px;
+  background: #f97316;
+  color: white;
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.hint {
+  margin-top: 18px;
+  color: #9ca3af;
+  font-size: 13px;
+}
+
+#frame {
+  display: none;
   width: 100%;
-  height: calc(100vh - 62px);
+  height: calc(100vh - 64px);
   border: 0;
   background: white;
 }
-
 </style>
-
 </head>
 
 <body>
 
-<div class="toolbar">
+<div class="topbar">
 
-<button
-  type="button"
-  onclick="goBack()"
-  title="Back"
->
-←
-</button>
+  <div class="logo">
+    Web Gateway
+  </div>
 
-<button
-  type="button"
-  onclick="goForward()"
-  title="Forward"
->
-→
-</button>
+  <form class="search" id="topSearch">
+    <input
+      id="topInput"
+      placeholder="Search DuckDuckGo or enter a URL..."
+      autocomplete="off"
+    >
+    <button type="submit">Go</button>
+  </form>
 
-<button
-  type="button"
-  onclick="reloadFrame()"
-  title="Reload"
->
-↻
-</button>
+</div>
 
-<form id="form">
+<div class="home" id="home">
 
-<input
-  id="address"
-  autocomplete="off"
-  spellcheck="false"
-  placeholder="Search DuckDuckGo or enter a URL"
->
+  <div class="card">
 
-<button type="submit">
-Go
-</button>
+    <div class="ddg">
+      DuckDuckGo
+    </div>
 
-</form>
+    <div class="subtitle">
+      Private search through your VPS web gateway
+    </div>
+
+    <form class="bigsearch" id="mainSearch">
+
+      <input
+        id="mainInput"
+        placeholder="Search the web or enter a website..."
+        autocomplete="off"
+        autofocus
+      >
+
+      <button type="submit">
+        Search
+      </button>
+
+    </form>
+
+    <div class="hint">
+      Try: wikipedia.org &nbsp; • &nbsp; example.com &nbsp; • &nbsp; your search
+    </div>
+
+  </div>
 
 </div>
 
 <iframe
   id="frame"
-  title="Proxy Browser"
+  sandbox="allow-forms allow-modals allow-popups allow-presentation allow-same-origin allow-scripts"
 ></iframe>
 
 <script>
 
-const form =
-  document.getElementById("form");
-
-const address =
-  document.getElementById("address");
-
-const frame =
-  document.getElementById("frame");
-
-
-function isUrl(value) {
-
-  return /^https?:\\/\\//i.test(value);
-
-}
-
-
-function looksLikeDomain(value) {
-
-  return /^[a-z0-9.-]+\\.[a-z]{2,}(?::\\d+)?(?:\\/.*)?$/i
-    .test(value);
-
-}
-
-
-function buildDestination(value) {
+function makeDestination(value) {
 
   value = value.trim();
 
-  if (!value) {
+  if (!value) return null;
 
-    return "https://duckduckgo.com/";
-
-  }
-
-  /*
-   * Explicit URL.
-   */
-
-  if (isUrl(value)) {
-
+  if (/^https?:\\/\\//i.test(value)) {
     return value;
-
   }
 
-  /*
-   * Domain without protocol.
-   */
-
-  if (looksLikeDomain(value)) {
-
+  if (/^[a-z0-9.-]+\\.[a-z]{2,}(\\/.*)?$/i.test(value)) {
     return "https://" + value;
-
   }
 
-  /*
-   * Search query.
-   *
-   * DuckDuckGo search.
-   */
-
-  return (
-    "https://duckduckgo.com/?q=" +
-    encodeURIComponent(value) +
-    "&kl=se-sv"
-  );
-
+  return "https://duckduckgo.com/?q="
+    + encodeURIComponent(value)
+    + "&kl=se-sv";
 }
 
+function openDestination(value) {
 
-function navigate(value) {
+  const destination = makeDestination(value);
 
-  const destination =
-    buildDestination(value);
+  if (!destination) return;
 
-  address.value = destination;
+  const frame = document.getElementById("frame");
+  const home = document.getElementById("home");
+
+  home.style.display = "none";
+  frame.style.display = "block";
 
   frame.src =
-    "/proxy?url=" +
-    encodeURIComponent(destination);
-
+    "/proxy?url="
+    + encodeURIComponent(destination);
 }
 
+function submitSearch(inputId) {
 
-form.addEventListener(
-  "submit",
-  function(event) {
+  const input = document.getElementById(inputId);
+
+  openDestination(input.value);
+}
+
+document
+  .getElementById("mainSearch")
+  .addEventListener("submit", function(event) {
+
+    event.preventDefault();
+    submitSearch("mainInput");
+
+  });
+
+document
+  .getElementById("topSearch")
+  .addEventListener("submit", function(event) {
 
     event.preventDefault();
 
-    navigate(address.value);
+    const value =
+      document.getElementById("topInput").value;
 
-  }
-);
+    document.getElementById("mainInput").value = value;
 
+    openDestination(value);
 
-function reloadFrame() {
-
-  try {
-
-    frame.contentWindow.location.reload();
-
-  } catch {
-
-    frame.src = frame.src;
-
-  }
-
-}
-
-
-function goBack() {
-
-  try {
-
-    frame.contentWindow.history.back();
-
-  } catch {}
-
-}
-
-
-function goForward() {
-
-  try {
-
-    frame.contentWindow.history.forward();
-
-  } catch {}
-
-}
-
-
-/*
- * Start with DuckDuckGo.
- */
-
-navigate("");
+  });
 
 </script>
+
+</body>
+</html>`);
+});
+
+/* -------------------------------------------------------
+   Login/session test
+------------------------------------------------------- */
+
+app.get("/login", (req, res) => {
+  const sessionId =
+    req.cookies.proxy_test_session || makeId();
+
+  res.cookie("proxy_test_session", sessionId, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: false,
+    maxAge: 60 * 60 * 1000
+  });
+
+  res.send(`
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Session Test</title>
+</head>
+
+<body style="font-family:Arial;padding:40px">
+
+<h1>Session test</h1>
+
+<p>Your test session is active.</p>
+
+<p>
+<a href="/session">Check session</a>
+</p>
+
+<p>
+<a href="/browser">Open browser</a>
+</p>
 
 </body>
 </html>
 `);
 });
 
-/* =========================================================
-   MAIN HTTP/HTTPS PROXY
-   ========================================================= */
+app.get("/session", (req, res) => {
+  res.json({
+    authenticated: Boolean(req.cookies.proxy_test_session),
+    session: req.cookies.proxy_test_session || null
+  });
+});
 
-app.all("/proxy", async (req, res) => {
+app.get("/api/session", (req, res) => {
+  res.json({
+    ok: true,
+    authenticated: Boolean(req.cookies.proxy_test_session)
+  });
+});
 
-  if (!checkProxyKey(req, res)) {
-    return;
-  }
+/* -------------------------------------------------------
+   Proxy
+------------------------------------------------------- */
 
-  const target = req.query.url;
+app.all("/proxy", requireProxyKey, async (req, res) => {
 
-  if (
-    typeof target !== "string" ||
-    !target.trim()
-  ) {
+  const rawUrl = req.query.url;
+
+  if (!rawUrl) {
     return res.status(400).json({
       error: "Missing URL",
-      usage:
-        "/proxy?url=https://example.com",
+      example: "/proxy?url=https://example.com"
     });
   }
 
-  let targetUrl;
+  let destination;
 
   try {
-
-    targetUrl =
-      await validateDestination(target);
-
+    destination = await validateDestination(rawUrl);
   } catch (error) {
-
-    return res.status(403).json({
-      error: "Destination blocked",
-      message: error.message,
+    return res.status(400).json({
+      error: "Invalid destination",
+      message: error.message
     });
-
   }
 
-  const session =
-    getOrCreateSession(req, res);
+  const session = getSession(req, res);
 
-  const headers =
-    getForwardHeaders(
-      req,
-      session
-    );
+  const controller = new AbortController();
 
-  const body =
-    getRequestBody(req);
-
-  const controller =
-    new AbortController();
-
-  const timeout =
-    setTimeout(
-      () =>
-        controller.abort(),
-      REQUEST_TIMEOUT
-    );
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, 30000);
 
   try {
 
-    console.log(
-      `[PROXY] ${req.method} ${targetUrl.href}`
-    );
+    const headers = {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
 
-    const upstream =
-      await fetch(
-        targetUrl.href,
-        {
-          method: req.method,
-          headers,
-          body,
-          redirect: "manual",
-          signal:
-            controller.signal,
-        }
-      );
+      "Accept":
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
 
-    storeUpstreamCookies(
-      upstream,
-      session
-    );
+      "Accept-Language":
+        "sv-SE,sv;q=0.9,en-US;q=0.8,en;q=0.7"
+    };
 
-    /*
-     * Redirect handling.
-     */
+    const cookieHeader = buildCookieHeader(session);
 
-    if (
-      upstream.status >= 300 &&
-      upstream.status < 400
-    ) {
-
-      const location =
-        upstream.headers.get(
-          "location"
-        );
-
-      if (location) {
-
-        try {
-
-          const absolute =
-            new URL(
-              location,
-              targetUrl
-            );
-
-          if (
-            ["http:", "https:"].includes(
-              absolute.protocol
-            )
-          ) {
-
-            await validateDestination(
-              absolute.href
-            );
-
-            return res.redirect(
-              upstream.status,
-              makeProxyUrl(
-                absolute.href
-              )
-            );
-
-          }
-
-        } catch {
-          // Return original response.
-        }
-      }
+    if (cookieHeader) {
+      headers.Cookie = cookieHeader;
     }
-
-    copyResponseHeaders(
-      upstream,
-      res
-    );
-
-    res.status(
-      upstream.status
-    );
 
     const contentType =
-      upstream.headers.get(
-        "content-type"
-      ) || "";
+      req.headers["content-type"];
 
-    /*
-     * HTML.
-     */
-
-    if (
-      contentType.includes(
-        "text/html"
-      )
-    ) {
-
-      const text =
-        await upstream.text();
-
-      const rewritten =
-        rewriteHtml(
-          text,
-          targetUrl.href
-        );
-
-      res.setHeader(
-        "content-type",
-        "text/html; charset=utf-8"
-      );
-
-      return res.send(
-        rewritten
-      );
+    if (contentType) {
+      headers["Content-Type"] = contentType;
     }
 
-    /*
-     * Everything else.
-     */
+    const options = {
+      method: req.method,
+      headers,
+      redirect: "manual",
+      signal: controller.signal
+    };
 
-    if (upstream.body) {
+    if (
+      !["GET", "HEAD"].includes(req.method)
+    ) {
 
-      const reader =
-        upstream.body.getReader();
+      if (
+        typeof req.body === "string" ||
+        Buffer.isBuffer(req.body)
+      ) {
 
-      try {
+        options.body = req.body;
 
-        while (true) {
+      } else if (
+        contentType?.includes("application/json")
+      ) {
 
-          const {
-            done,
-            value,
-          } =
-            await reader.read();
+        options.body =
+          JSON.stringify(req.body || {});
 
-          if (done) {
-            break;
-          }
+      } else if (
+        contentType?.includes(
+          "application/x-www-form-urlencoded"
+        )
+      ) {
 
-          if (
-            !res.write(
-              Buffer.from(value)
-            )
-          ) {
-
-            await new Promise(
-              (resolve) =>
-                res.once(
-                  "drain",
-                  resolve
-                )
-            );
-
-          }
-        }
-
-      } finally {
-
-        reader.releaseLock();
-
+        options.body =
+          new URLSearchParams(req.body || {})
+            .toString();
       }
-
-      return res.end();
     }
 
-    return res.end();
+    console.log("");
+    console.log("=================================");
+    console.log("[PROXY REQUEST]");
+    console.log("Method:", req.method);
+    console.log("URL:", destination.href);
+    console.log("=================================");
 
-  } catch (error) {
-
-    console.error(
-      "[PROXY ERROR]",
-      error
-    );
-
-    if (
-      error.name ===
-      "AbortError"
-    ) {
-
-      return res.status(504).json({
-        error:
-          "Gateway timeout",
-        message:
-          `The destination did not respond within ${REQUEST_TIMEOUT}ms.`,
-      });
-
-    }
-
-    return res.status(502).json({
-      error:
-        "Bad gateway",
-      message:
-        error.message ||
-        "Unable to contact destination",
-    });
-
-  } finally {
+    const response =
+      await fetch(destination, options);
 
     clearTimeout(timeout);
 
-  }
+    console.log("[PROXY RESPONSE]");
+    console.log("Status:", response.status);
+    console.log(
+      "Content-Type:",
+      response.headers.get("content-type")
+    );
+    console.log(
+      "Server:",
+      response.headers.get("server")
+    );
+    console.log(
+      "Location:",
+      response.headers.get("location")
+    );
 
-});
+    /* -----------------------------------------------
+       Upstream cookies
+    ------------------------------------------------ */
 
-/* =========================================================
-   HEALTH
-   ========================================================= */
-
-app.get("/health", (req, res) => {
-
-  res.json({
-    status: "ok",
-    service:
-      "xcloud-test-proxy",
-    uptime:
-      process.uptime(),
-    node:
-      process.version,
-    time:
-      new Date().toISOString(),
-  });
-
-});
-
-/* =========================================================
-   WEBSOCKET TEST
-   ========================================================= */
-
-const wss =
-  new WebSocketServer({
-    noServer: true,
-  });
-
-server.on(
-  "upgrade",
-  (request, socket, head) => {
-
-    const url =
-      new URL(
-        request.url,
-        `http://${
-          request.headers.host ||
-          "localhost"
-        }`
-      );
+    let setCookies = [];
 
     if (
-      url.pathname !==
-      "/stream"
+      typeof response.headers.getSetCookie === "function"
     ) {
+      setCookies =
+        response.headers.getSetCookie();
+    } else {
 
-      socket.destroy();
-      return;
+      const single =
+        response.headers.get("set-cookie");
 
+      if (single) {
+        setCookies = [single];
+      }
     }
 
-    wss.handleUpgrade(
-      request,
-      socket,
-      head,
-      (ws) => {
+    storeSetCookie(session, setCookies);
 
-        wss.emit(
-          "connection",
-          ws,
-          request
+    /* -----------------------------------------------
+       Redirect
+    ------------------------------------------------ */
+
+    if (
+      response.status >= 300 &&
+      response.status < 400
+    ) {
+
+      const location =
+        response.headers.get("location");
+
+      if (location) {
+
+        const redirected =
+          new URL(location, destination);
+
+        const safeRedirect =
+          await validateDestination(
+            redirected.href
+          );
+
+        const proxyUrl =
+          "/proxy?url=" +
+          encodeURIComponent(
+            safeRedirect.href
+          );
+
+        return res.redirect(
+          response.status,
+          proxyUrl
         );
-
       }
-    );
+    }
 
-  }
-);
+    /* -----------------------------------------------
+       Headers
+    ------------------------------------------------ */
 
-wss.on(
-  "connection",
-  (ws) => {
+    const responseType =
+      response.headers.get("content-type") || "";
 
-    let counter = 0;
+    const responseEncoding =
+      response.headers.get("content-encoding");
 
-    const interval =
-      setInterval(
-        () => {
+    const headersToSkip = new Set([
+      "content-length",
+      "content-encoding",
+      "transfer-encoding",
+      "connection",
+      "keep-alive",
+      "x-frame-options",
+      "content-security-policy"
+    ]);
 
-          if (
-            ws.readyState !==
-            ws.OPEN
-          ) {
+    for (const [key, value] of response.headers) {
 
-            clearInterval(
-              interval
-            );
+      if (
+        headersToSkip.has(key.toLowerCase())
+      ) {
+        continue;
+      }
 
-            return;
-          }
+      if (
+        key.toLowerCase() === "set-cookie"
+      ) {
+        continue;
+      }
 
-          counter++;
+      res.setHeader(key, value);
+    }
 
-          const payload =
-            Buffer.alloc(1024);
+    /*
+      fetch() may automatically decode compressed
+      responses. Therefore content-encoding is removed.
+    */
 
-          payload.writeUInt32BE(
-            counter,
-            0
-          );
+    if (responseEncoding) {
+      res.removeHeader("content-encoding");
+    }
 
-          payload.writeUInt32BE(
-            Date.now() >>> 0,
-            4
-          );
+    /* -----------------------------------------------
+       HTML
+    ------------------------------------------------ */
 
-          ws.send(payload);
+    if (
+      responseType.includes("text/html") ||
+      responseType.includes("application/xhtml+xml")
+    ) {
 
-          if (
-            counter >= 30
-          ) {
+      let html =
+        await response.text();
 
-            clearInterval(
-              interval
-            );
-
-            ws.close(
-              1000,
-              "Test stream complete"
-            );
-
-          }
-
-        },
-        250
+      html = rewriteHtml(
+        html,
+        destination.href
       );
 
-    ws.on(
-      "close",
-      () => {
-        clearInterval(
-          interval
+      return res
+        .status(response.status)
+        .type("html")
+        .send(html);
+    }
+
+    /* -----------------------------------------------
+       Other content
+    ------------------------------------------------ */
+
+    const buffer =
+      Buffer.from(
+        await response.arrayBuffer()
+      );
+
+    return res
+      .status(response.status)
+      .send(buffer);
+
+  } catch (error) {
+
+    clearTimeout(timeout);
+
+    console.error("");
+    console.error("==============================");
+    console.error("[PROXY ERROR]");
+    console.error("Message:", error?.message);
+    console.error("Name:", error?.name);
+    console.error("Cause:", error?.cause);
+    console.error("==============================");
+
+    return res.status(502).json({
+
+      error: "Bad gateway",
+
+      message:
+        error?.message ||
+        "Unable to contact destination.",
+
+      cause: error?.cause
+        ? {
+            code: error.cause.code,
+            errno: error.cause.errno,
+            syscall: error.cause.syscall,
+            hostname: error.cause.hostname
+          }
+        : null
+    });
+  }
+});
+
+/* -------------------------------------------------------
+   HTML rewriting
+------------------------------------------------------- */
+
+function rewriteHtml(html, baseUrl) {
+
+  const base = new URL(baseUrl);
+
+  /*
+    Remove CSP meta tags because they can prevent
+    the proxied page from loading its resources.
+  */
+
+  html = html.replace(
+    /<meta[^>]+http-equiv=["']?Content-Security-Policy["']?[^>]*>/gi,
+    ""
+  );
+
+  /*
+    Remove base tags because they can make rewritten
+    relative URLs resolve against the original site.
+  */
+
+  html = html.replace(
+    /<base[^>]*>/gi,
+    ""
+  );
+
+  /*
+    Rewrite normal URL attributes.
+  */
+
+  html = html.replace(
+    /\b(href|src|action)=("([^"]*)"|'([^']*)')/gi,
+    (match, attribute, wrapper, doubleValue, singleValue) => {
+
+      const value =
+        doubleValue ?? singleValue ?? "";
+
+      const rewritten =
+        rewriteResourceUrl(
+          value,
+          base
         );
+
+      if (!rewritten) {
+        return match;
       }
+
+      return `${attribute}="${escapeHtml(rewritten)}"`;
+    }
+  );
+
+  /*
+    Rewrite srcset.
+  */
+
+  html = html.replace(
+    /\bsrcset=("([^"]*)"|'([^']*)')/gi,
+    (match, wrapper, doubleValue, singleValue) => {
+
+      const value =
+        doubleValue ?? singleValue ?? "";
+
+      const rewritten =
+        value
+          .split(",")
+          .map(part => {
+
+            const pieces =
+              part.trim().split(/\s+/);
+
+            if (!pieces[0]) {
+              return part;
+            }
+
+            const newUrl =
+              rewriteResourceUrl(
+                pieces[0],
+                base
+              );
+
+            if (!newUrl) {
+              return part;
+            }
+
+            pieces[0] = newUrl;
+
+            return pieces.join(" ");
+          })
+          .join(", ");
+
+      return `srcset="${escapeHtml(rewritten)}"`;
+    }
+  );
+
+  /*
+    Insert a small helper so navigation from ordinary
+    links stays inside the proxy.
+  */
+
+  const helper = `
+<script>
+(function () {
+
+  function proxyNavigation(event) {
+
+    const link =
+      event.target.closest("a");
+
+    if (!link) return;
+
+    const href =
+      link.getAttribute("href");
+
+    if (!href) return;
+
+    if (
+      href.startsWith("#") ||
+      href.startsWith("javascript:") ||
+      href.startsWith("mailto:")
+    ) {
+      return;
+    }
+
+    try {
+
+      const absolute =
+        new URL(
+          href,
+          document.baseURI
+        ).href;
+
+      if (
+        absolute.startsWith("http://") ||
+        absolute.startsWith("https://")
+      ) {
+
+        event.preventDefault();
+
+        window.location.href =
+          "/proxy?url=" +
+          encodeURIComponent(absolute);
+      }
+
+    } catch (_) {}
+
+  }
+
+  document.addEventListener(
+    "click",
+    proxyNavigation,
+    true
+  );
+
+})();
+</script>
+`;
+
+  if (/<\/body>/i.test(html)) {
+
+    html = html.replace(
+      /<\/body>/i,
+      helper + "</body>"
     );
 
+  } else {
+
+    html += helper;
   }
-);
 
-/* =========================================================
-   404
-   ========================================================= */
+  return html;
+}
 
-app.use(
-  (req, res) => {
+function rewriteResourceUrl(value, base) {
 
-    res.status(404).json({
-      error: "Not found",
-    });
+  if (!value) return null;
+
+  const trimmed =
+    value.trim();
+
+  if (
+    trimmed.startsWith("#") ||
+    trimmed.startsWith("data:") ||
+    trimmed.startsWith("blob:") ||
+    trimmed.startsWith("javascript:") ||
+    trimmed.startsWith("mailto:") ||
+    trimmed.startsWith("tel:")
+  ) {
+    return null;
+  }
+
+  try {
+
+    const absolute =
+      new URL(trimmed, base);
+
+    if (
+      absolute.protocol !== "http:" &&
+      absolute.protocol !== "https:"
+    ) {
+      return null;
+    }
+
+    return (
+      "/proxy?url=" +
+      encodeURIComponent(
+        absolute.href
+      )
+    );
+
+  } catch {
+
+    return null;
+  }
+}
+
+/* -------------------------------------------------------
+   Health
+------------------------------------------------------- */
+
+app.get("/health", (_req, res) => {
+
+  res.json({
+    ok: true,
+    service: "xcloud-test-proxy",
+    time: new Date().toISOString(),
+    node: process.version
+  });
+
+});
+
+/* -------------------------------------------------------
+   WebSocket test
+------------------------------------------------------- */
+
+server.on("upgrade", (request, socket, head) => {
+
+  const url =
+    new URL(
+      request.url,
+      `http://${request.headers.host}`
+    );
+
+  if (url.pathname !== "/stream") {
+
+    socket.destroy();
+    return;
+  }
+
+  wss.handleUpgrade(
+    request,
+    socket,
+    head,
+    ws => {
+
+      wss.emit(
+        "connection",
+        ws,
+        request
+      );
+
+    }
+  );
+});
+
+wss.on("connection", ws => {
+
+  let packets = 0;
+
+  const interval =
+    setInterval(() => {
+
+      if (ws.readyState !== ws.OPEN) {
+        clearInterval(interval);
+        return;
+      }
+
+      packets++;
+
+      ws.send(
+        JSON.stringify({
+          type: "packet",
+          number: packets,
+          timestamp: Date.now(),
+          payload: "VPS stream test"
+        })
+      );
+
+      if (packets >= 30) {
+
+        clearInterval(interval);
+
+        ws.send(
+          JSON.stringify({
+            type: "complete"
+          })
+        );
+
+        ws.close();
+      }
+
+    }, 250);
+
+  ws.on("close", () => {
+    clearInterval(interval);
+  });
+
+});
+
+/* -------------------------------------------------------
+   Cleanup old sessions
+------------------------------------------------------- */
+
+setInterval(() => {
+
+  const now = Date.now();
+
+  for (const [id, session] of sessions) {
+
+    if (
+      now - session.createdAt >
+      24 * 60 * 60 * 1000
+    ) {
+      sessions.delete(id);
+    }
 
   }
-);
 
-/* =========================================================
-   START
-   ========================================================= */
+}, 60 * 60 * 1000);
+
+/* -------------------------------------------------------
+   Start
+------------------------------------------------------- */
 
 server.listen(
   PORT,
   "0.0.0.0",
   () => {
 
-    console.log(`
-========================================
- XCloud VPS Proxy
-========================================
-
-Port:
-  ${PORT}
-
-Node:
-  ${process.version}
-
-Timeout:
-  ${REQUEST_TIMEOUT}ms
-
-Allowlist:
-  ${
-    ALLOWLIST.length
-      ? ALLOWLIST.join(", ")
-      : "Public HTTP/HTTPS"
-  }
-
-Proxy key:
-  ${
-    PROXY_KEY
-      ? "Enabled"
-      : "Disabled"
-  }
-
-Browser:
-  /browser
-
-Proxy:
-  /proxy?url=https://example.com
-
-Health:
-  /health
-
-WebSocket test:
-  /stream
-
-Search engine:
-  DuckDuckGo
-
-========================================
-`);
+    console.log("");
+    console.log("=================================");
+    console.log("XCloud Test Proxy");
+    console.log("=================================");
+    console.log(`Port: ${PORT}`);
+    console.log(`Node: ${process.version}`);
+    console.log(
+      `Proxy key: ${PROXY_KEY ? "enabled" : "disabled"}`
+    );
+    console.log(
+      `Allowlist: ${
+        process.env.PROXY_ALLOWLIST
+          ? "enabled"
+          : "disabled"
+      }`
+    );
+    console.log("");
+    console.log(
+      `Browser: http://0.0.0.0:${PORT}/browser`
+    );
+    console.log(
+      `Health:  http://0.0.0.0:${PORT}/health`
+    );
+    console.log("=================================");
 
   }
 );
