@@ -1,0 +1,365 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #08090c;
+  color: #ffffff;
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+body {
+  user-select: none;
+}
+
+#game {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background: #101318;
+}
+
+canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* =========================
+   TOP UI
+   ========================= */
+
+.hud {
+  position: absolute;
+  top: 18px;
+  left: 18px;
+  right: 18px;
+  z-index: 10;
+
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+
+  pointer-events: none;
+}
+
+.hud-left,
+.hud-right {
+  display: flex;
+  gap: 10px;
+}
+
+.hud-box {
+  min-width: 105px;
+  padding: 10px 14px;
+
+  background: rgba(10, 12, 16, 0.84);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+
+  backdrop-filter: blur(10px);
+}
+
+.hud-label {
+  display: block;
+  color: #8f96a3;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  margin-bottom: 3px;
+}
+
+.hud-value {
+  font-size: 20px;
+  font-weight: 700;
+}
+
+/* =========================
+   BOOST
+   ========================= */
+
+.boost-container {
+  position: absolute;
+  left: 50%;
+  bottom: 25px;
+  transform: translateX(-50%);
+
+  width: min(320px, 45vw);
+
+  z-index: 10;
+}
+
+.boost-label {
+  display: flex;
+  justify-content: space-between;
+
+  font-size: 11px;
+  color: #aaa;
+
+  margin-bottom: 5px;
+}
+
+.boost-bar {
+  height: 12px;
+  border-radius: 10px;
+
+  overflow: hidden;
+
+  background: rgba(0, 0, 0, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.boost-fill {
+  height: 100%;
+  width: 100%;
+
+  background: linear-gradient(
+    90deg,
+    #ff9d00,
+    #ff3d00
+  );
+
+  transition: width 0.1s linear;
+}
+
+/* =========================
+   COUNTDOWN
+   ========================= */
+
+.countdown {
+  position: absolute;
+  inset: 0;
+
+  display: flex;
+  justify-content: center;
+  align-items: center;
+
+  z-index: 30;
+
+  pointer-events: none;
+
+  font-size: clamp(70px, 15vw, 170px);
+  font-weight: 900;
+
+  text-shadow:
+    0 5px 30px rgba(0, 0, 0, 0.8);
+
+  opacity: 0;
+}
+
+/* =========================
+   START SCREEN
+   ========================= */
+
+.overlay {
+  position: absolute;
+  inset: 0;
+
+  z-index: 40;
+
+  display: flex;
+  justify-content: center;
+  align-items: center;
+
+  background: rgba(5, 6, 8, 0.78);
+  backdrop-filter: blur(12px);
+}
+
+.panel {
+  width: min(500px, 90vw);
+  padding: 35px;
+
+  text-align: center;
+
+  background: #111419;
+  border: 1px solid #2c3038;
+  border-radius: 18px;
+
+  box-shadow:
+    0 25px 80px rgba(0, 0, 0, 0.55);
+}
+
+.panel h1 {
+  margin: 0 0 8px;
+
+  font-size: clamp(35px, 7vw, 65px);
+  letter-spacing: -2px;
+}
+
+.panel p {
+  color: #949ba8;
+  line-height: 1.5;
+}
+
+.panel button {
+  margin-top: 20px;
+
+  border: 0;
+  border-radius: 10px;
+
+  padding: 14px 28px;
+
+  background: #ffffff;
+  color: #08090c;
+
+  font-size: 15px;
+  font-weight: 800;
+
+  cursor: pointer;
+
+  transition:
+    transform 0.15s,
+    opacity 0.15s;
+}
+
+.panel button:hover {
+  transform: translateY(-2px);
+}
+
+.panel button:active {
+  transform: translateY(1px);
+}
+
+/* =========================
+   FINISH
+   ========================= */
+
+.finish {
+  display: none;
+}
+
+.finish.show {
+  display: flex;
+}
+
+.result {
+  margin: 20px 0;
+}
+
+.result-position {
+  font-size: 55px;
+  font-weight: 900;
+}
+
+.result-time {
+  color: #9da4b1;
+}
+
+/* =========================
+   CONTROLS
+   ========================= */
+
+.controls {
+  position: absolute;
+  bottom: 20px;
+  left: 20px;
+
+  z-index: 10;
+
+  color: rgba(255, 255, 255, 0.55);
+
+  font-size: 11px;
+  line-height: 1.7;
+
+  pointer-events: none;
+}
+
+.controls strong {
+  color: #fff;
+}
+
+/* =========================
+   MOBILE
+   ========================= */
+
+.mobile-controls {
+  display: none;
+}
+
+@media (max-width: 700px) {
+  .hud {
+    top: 8px;
+    left: 8px;
+    right: 8px;
+  }
+
+  .hud-box {
+    min-width: 75px;
+    padding: 7px 9px;
+  }
+
+  .hud-value {
+    font-size: 15px;
+  }
+
+  .controls {
+    display: none;
+  }
+
+  .mobile-controls {
+    display: block;
+
+    position: absolute;
+    inset: auto 15px 15px 15px;
+
+    z-index: 20;
+
+    pointer-events: none;
+  }
+
+  .mobile-button {
+    width: 58px;
+    height: 58px;
+
+    border-radius: 50%;
+
+    background: rgba(20, 22, 27, 0.8);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+
+    color: white;
+
+    display: flex;
+    justify-content: center;
+    align-items: center;
+
+    font-size: 20px;
+
+    pointer-events: auto;
+  }
+
+  .mobile-left {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+  }
+
+  .mobile-right {
+    position: absolute;
+    left: 70px;
+    bottom: 0;
+  }
+
+  .mobile-gas {
+    position: absolute;
+    right: 70px;
+    bottom: 0;
+  }
+
+  .mobile-brake {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+  }
+
+  .boost-container {
+    bottom: 85px;
+  }
+}
