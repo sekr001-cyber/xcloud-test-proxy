@@ -1,1536 +1,678 @@
-```js
 import express from "express";
 import http from "http";
 import https from "https";
 import dns from "dns";
+import dnsPromises from "dns/promises";
 import crypto from "crypto";
-import { WebSocketServer } from "ws";
+import net from "net";
+
+dns.setDefaultResultOrder("ipv4first");
 
 const app = express();
 
 const PORT = Number(process.env.PORT || 10000);
+const PROXY_KEY = process.env.PROXY_KEY || "";
+const REQUEST_TIMEOUT = 30000;
 
 const sessions = new Map();
-
-/*
- * Render / Node networking
- *
- * Force DNS resolution toward IPv4 first.
- * This avoids many VPS/container IPv6 connection problems.
- */
-dns.setDefaultResultOrder("ipv4first");
-
-/* -------------------------------------------------------
-   Express
-------------------------------------------------------- */
 
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true, limit: "5mb" }));
 
-app.use((req, _res, next) => {
-  req.cookies = {};
+/* =========================================================
+   BASIC HELPERS
+   ========================================================= */
 
-  const cookieHeader = req.headers.cookie || "";
-
-  for (const part of cookieHeader.split(";")) {
-    const index = part.indexOf("=");
-
-    if (index === -1) continue;
-
-    const name = part.slice(0, index).trim();
-    const value = part.slice(index + 1).trim();
-
-    if (name) {
-      req.cookies[name] = value;
-    }
-  }
-
-  next();
-});
-
-/* -------------------------------------------------------
-   Helpers
-------------------------------------------------------- */
-
-function randomId() {
+function makeId() {
   return crypto.randomBytes(24).toString("hex");
 }
 
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
-function createSession() {
-  const id = randomId();
-
-  sessions.set(id, {
-    createdAt: Date.now(),
-    cookies: new Map()
-  });
-
-  return id;
-}
-
 function getSession(req, res) {
-  let id = req.cookies.proxy_session;
+  let id = req.headers["x-proxy-session"];
 
-  if (!id || !sessions.has(id)) {
-    id = createSession();
+  if (!id || typeof id !== "string" || !sessions.has(id)) {
+    id = makeId();
 
-    res.cookie("proxy_session", id, {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: false,
-      maxAge: 24 * 60 * 60 * 1000
+    sessions.set(id, {
+      cookies: new Map(),
+      created: Date.now()
     });
+
+    res.setHeader("X-Proxy-Session", id);
   }
 
   return sessions.get(id);
 }
 
 function getCookieHeader(session) {
-  return [...session.cookies.entries()]
-    .map(([name, value]) => `${name}=${value}`)
-    .join("; ");
+  const values = [];
+
+  for (const entry of session.cookies.entries()) {
+    values.push(entry[0] + "=" + entry[1]);
+  }
+
+  return values.join("; ");
 }
 
-function storeCookies(session, headers) {
-  const cookies = headers["set-cookie"];
+function saveCookies(session, setCookieHeaders) {
+  if (!setCookieHeaders) {
+    return;
+  }
 
-  if (!cookies) return;
+  const list = Array.isArray(setCookieHeaders)
+    ? setCookieHeaders
+    : [setCookieHeaders];
 
-  for (const cookie of cookies) {
-    const first = cookie.split(";")[0];
+  for (const cookieString of list) {
+    const firstPart = String(cookieString).split(";")[0];
+    const separator = firstPart.indexOf("=");
 
-    const index = first.indexOf("=");
-
-    if (index === -1) continue;
-
-    const name = first.slice(0, index).trim();
-    const value = first.slice(index + 1).trim();
-
-    if (name) {
-      session.cookies.set(name, value);
+    if (separator <= 0) {
+      continue;
     }
+
+    const name = firstPart.slice(0, separator).trim();
+    const value = firstPart.slice(separator + 1).trim();
+
+    if (!name) {
+      continue;
+    }
+
+    session.cookies.set(name, value);
   }
 }
 
-/* -------------------------------------------------------
-   SSRF protection
-------------------------------------------------------- */
-
 function isPrivateIPv4(ip) {
-  const p = ip.split(".").map(Number);
+  const parts = ip.split(".").map(Number);
 
-  if (p.length !== 4 || p.some(Number.isNaN)) {
+  if (parts.length !== 4 || parts.some(Number.isNaN)) {
     return false;
   }
 
-  const [a, b] = p;
-
-  return (
-    a === 10 ||
-    a === 127 ||
-    (a === 169 && b === 254) ||
-    (a === 192 && b === 168) ||
-    (a === 172 && b >= 16 && b <= 31)
-  );
-}
-
-function isPrivateIPv6(ip) {
-  const value = ip.toLowerCase();
-
-  return (
-    value === "::1" ||
-    value.startsWith("fc") ||
-    value.startsWith("fd") ||
-    value.startsWith("fe80:")
-  );
-}
-
-async function validateUrl(input) {
-  let url;
-
-  try {
-    url = new URL(input);
-  } catch {
-    throw new Error("Invalid URL.");
+  if (parts[0] === 10) {
+    return true;
   }
 
-  if (!["http:", "https:"].includes(url.protocol)) {
-    throw new Error("Only HTTP and HTTPS are supported.");
+  if (parts[0] === 127) {
+    return true;
   }
 
-  const hostname = url.hostname.toLowerCase();
+  if (parts[0] === 169 && parts[1] === 254) {
+    return true;
+  }
+
+  if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) {
+    return true;
+  }
+
+  if (parts[0] === 192 && parts[1] === 168) {
+    return true;
+  }
+
+  if (parts[0] === 0) {
+    return true;
+  }
+
+  return false;
+}
+
+function isBlockedAddress(address) {
+  if (net.isIPv4(address)) {
+    return isPrivateIPv4(address);
+  }
+
+  if (net.isIPv6(address)) {
+    const lower = address.toLowerCase();
+
+    if (lower === "::1") {
+      return true;
+    }
+
+    if (lower.startsWith("fc") || lower.startsWith("fd")) {
+      return true;
+    }
+
+    if (lower.startsWith("fe80:")) {
+      return true;
+    }
+
+    return false;
+  }
+
+  return true;
+}
+
+async function validateTarget(urlObject) {
+  if (!urlObject) {
+    throw new Error("Invalid URL");
+  }
+
+  if (urlObject.protocol !== "http:" && urlObject.protocol !== "https:") {
+    throw new Error("Only HTTP and HTTPS URLs are allowed");
+  }
+
+  const hostname = urlObject.hostname;
+
+  if (!hostname) {
+    throw new Error("Missing hostname");
+  }
+
+  const lowerHost = hostname.toLowerCase();
 
   if (
-    hostname === "localhost" ||
-    hostname.endsWith(".localhost") ||
-    hostname.endsWith(".local") ||
-    hostname === "0.0.0.0"
+    lowerHost === "localhost" ||
+    lowerHost.endsWith(".localhost") ||
+    lowerHost === "local"
   ) {
-    throw new Error("Local destinations are blocked.");
+    throw new Error("Local targets are blocked");
   }
 
-  const addresses = await dns.promises.lookup(hostname, {
+  const records = await dnsPromises.lookup(hostname, {
     all: true,
     verbatim: false
   });
 
-  if (!addresses.length) {
-    throw new Error("Could not resolve destination.");
+  if (!records.length) {
+    throw new Error("DNS lookup returned no addresses");
   }
 
-  for (const item of addresses) {
-    if (
-      isPrivateIPv4(item.address) ||
-      isPrivateIPv6(item.address)
-    ) {
-      throw new Error(
-        "Destination resolves to a private/local address."
-      );
+  for (const record of records) {
+    if (isBlockedAddress(record.address)) {
+      throw new Error("Target resolves to a private or local network");
     }
   }
 
-  return url;
+  return records;
 }
 
-/* -------------------------------------------------------
-   IPv4 HTTP/HTTPS request
-------------------------------------------------------- */
+/* =========================================================
+   HTTP REQUEST
+   ========================================================= */
 
-function requestUpstream(url, options = {}) {
-  return new Promise((resolve, reject) => {
-    const isHttps = url.protocol === "https:";
-
+function requestTarget(urlObject, method, headers, body, resolvedAddresses) {
+  return new Promise(function (resolve, reject) {
+    const isHttps = urlObject.protocol === "https:";
     const transport = isHttps ? https : http;
 
-    const defaultPort = isHttps ? 443 : 80;
+    const hostname = urlObject.hostname;
 
-    const requestOptions = {
-      protocol: url.protocol,
-
-      hostname: url.hostname,
-
-      /*
-       * Important:
-       * connect directly to the resolved IPv4 address.
-       */
-      port: url.port || defaultPort,
-
-      method: options.method || "GET",
-
-      path:
-        url.pathname +
-        url.search,
-
-      headers: options.headers || {},
-
-      timeout: 25000,
-
-      family: 4,
-
-      lookup(hostname, lookupOptions, callback) {
-        dns.lookup(
-          hostname,
-          {
-            family: 4
-          },
-          callback
-        );
-      }
+    const options = {
+      protocol: urlObject.protocol,
+      hostname: resolvedAddresses[0].address,
+      port: urlObject.port
+        ? Number(urlObject.port)
+        : isHttps
+          ? 443
+          : 80,
+      method: method,
+      path: urlObject.pathname + urlObject.search,
+      headers: {
+        ...headers,
+        Host: hostname
+      },
+      timeout: REQUEST_TIMEOUT,
+      servername: isHttps ? hostname : undefined
     };
 
-    const request = transport.request(
-      requestOptions,
-      response => {
+    const request = transport.request(options, function (response) {
+      const chunks = [];
 
-        const chunks = [];
+      response.on("data", function (chunk) {
+        chunks.push(chunk);
+      });
 
-        response.on("data", chunk => {
-          chunks.push(chunk);
+      response.on("end", function () {
+        resolve({
+          statusCode: response.statusCode || 502,
+          headers: response.headers,
+          body: Buffer.concat(chunks)
         });
-
-        response.on("end", () => {
-
-          resolve({
-            statusCode: response.statusCode || 502,
-
-            headers: response.headers,
-
-            body: Buffer.concat(chunks)
-          });
-
-        });
-
-      }
-    );
-
-    request.on("timeout", () => {
-      request.destroy(
-        new Error(
-          "Upstream connection timed out after 25 seconds."
-        )
-      );
+      });
     });
 
-    request.on("error", error => {
+    request.on("timeout", function () {
+      request.destroy(new Error("Upstream request timed out"));
+    });
+
+    request.on("error", function (error) {
       reject(error);
     });
 
-    if (options.body) {
-      request.write(options.body);
+    if (body && body.length > 0) {
+      request.write(body);
     }
 
     request.end();
   });
 }
 
-/* -------------------------------------------------------
-   Input handling
-------------------------------------------------------- */
+/* =========================================================
+   HTML REWRITING
+   ========================================================= */
 
-function destinationFromInput(value) {
-  value = String(value || "").trim();
-
-  if (!value) {
+function absoluteUrl(value, baseUrl) {
+  try {
+    return new URL(value, baseUrl).toString();
+  } catch {
     return null;
   }
+}
 
-  if (/^https?:\/\//i.test(value)) {
-    return value;
-  }
+function proxyUrl(url) {
+  return "/proxy?url=" + encodeURIComponent(url);
+}
 
-  if (
-    /^[a-z0-9.-]+\.[a-z]{2,}(\/.*)?$/i.test(value)
-  ) {
-    return `https://${value}`;
-  }
+function rewriteHtml(html, baseUrl) {
+  let output = html;
 
-  return (
-    "https://duckduckgo.com/?q=" +
-    encodeURIComponent(value) +
-    "&kl=se-sv"
+  output = output.replace(
+    /<base\s+[^>]*href=["']([^"']+)["'][^>]*>/gi,
+    ""
   );
-}
 
-/* -------------------------------------------------------
-   Homepage
-------------------------------------------------------- */
-
-app.get("/", (_req, res) => {
-  res.redirect("/browser");
-});
-
-/* -------------------------------------------------------
-   Browser UI
-------------------------------------------------------- */
-
-app.get("/browser", (_req, res) => {
-
-  res.type("html").send(`<!DOCTYPE html>
-
-<html lang="en">
-
-<head>
-
-<meta charset="UTF-8">
-
-<meta
-  name="viewport"
-  content="width=device-width, initial-scale=1.0"
->
-
-<title>Web Gateway</title>
-
-<style>
-
-* {
-  box-sizing: border-box;
-}
-
-html,
-body {
-  margin: 0;
-  width: 100%;
-  height: 100%;
-  font-family:
-    Arial,
-    Helvetica,
-    sans-serif;
-}
-
-body {
-  background: #f5f5f5;
-}
-
-.topbar {
-  height: 64px;
-
-  background: #111827;
-
-  display: flex;
-  align-items: center;
-
-  gap: 12px;
-
-  padding: 10px 16px;
-}
-
-.logo {
-  color: white;
-
-  font-size: 19px;
-
-  font-weight: 700;
-
-  white-space: nowrap;
-}
-
-.top-search {
-  flex: 1;
-
-  display: flex;
-
-  gap: 8px;
-}
-
-.top-search input {
-  flex: 1;
-
-  min-width: 0;
-
-  height: 42px;
-
-  border: none;
-
-  border-radius: 8px;
-
-  padding: 0 14px;
-
-  font-size: 15px;
-
-  outline: none;
-}
-
-button {
-  border: none;
-
-  background: #f97316;
-
-  color: white;
-
-  font-weight: 700;
-
-  border-radius: 8px;
-
-  cursor: pointer;
-}
-
-.top-search button {
-  padding: 0 18px;
-}
-
-.home {
-  height: calc(100vh - 64px);
-
-  display: flex;
-
-  align-items: center;
-
-  justify-content: center;
-
-  padding: 20px;
-}
-
-.card {
-  width: min(760px, 100%);
-
-  text-align: center;
-}
-
-.search-engine {
-  font-size: 48px;
-
-  font-weight: 800;
-
-  color: #111827;
-
-  margin-bottom: 8px;
-}
-
-.subtitle {
-  color: #6b7280;
-
-  margin-bottom: 28px;
-}
-
-.main-search {
-  display: flex;
-
-  gap: 10px;
-}
-
-.main-search input {
-  flex: 1;
-
-  height: 54px;
-
-  border: 1px solid #d1d5db;
-
-  border-radius: 12px;
-
-  padding: 0 18px;
-
-  font-size: 17px;
-
-  outline: none;
-}
-
-.main-search input:focus {
-  border-color: #f97316;
-}
-
-.main-search button {
-  padding: 0 24px;
-
-  font-size: 16px;
-}
-
-.hint {
-  margin-top: 16px;
-
-  color: #9ca3af;
-
-  font-size: 13px;
-}
-
-#browserFrame {
-  display: none;
-
-  position: absolute;
-
-  top: 64px;
-
-  left: 0;
-
-  width: 100%;
-
-  height: calc(100vh - 64px);
-
-  border: none;
-
-  background: white;
-}
-
-</style>
-
-</head>
-
-<body>
-
-<div class="topbar">
-
-  <div class="logo">
-    Web Gateway
-  </div>
-
-  <form
-    class="top-search"
-    id="topSearch"
-  >
-
-    <input
-      id="topInput"
-      autocomplete="off"
-      placeholder="Search DuckDuckGo or enter URL..."
-    >
-
-    <button type="submit">
-      Go
-    </button>
-
-  </form>
-
-</div>
-
-<div
-  class="home"
-  id="home"
->
-
-  <div class="card">
-
-    <div class="search-engine">
-      DuckDuckGo
-    </div>
-
-    <div class="subtitle">
-      Search the web through your Render gateway
-    </div>
-
-    <form
-      class="main-search"
-      id="mainSearch"
-    >
-
-      <input
-        id="mainInput"
-        autocomplete="off"
-        autofocus
-        placeholder="Search the web or enter a website..."
-      >
-
-      <button type="submit">
-        Search
-      </button>
-
-    </form>
-
-    <div class="hint">
-      Search something or enter example.com
-    </div>
-
-  </div>
-
-</div>
-
-<iframe
-  id="browserFrame"
-  sandbox="allow-forms allow-modals allow-popups allow-presentation allow-same-origin allow-scripts"
-></iframe>
-
-<script>
-
-function makeDestination(value) {
-
-  value = value.trim();
-
-  if (!value) {
-    return null;
-  }
-
-  if (/^https?:\\/\\//i.test(value)) {
-    return value;
-  }
-
-  if (
-    /^[a-z0-9.-]+\\.[a-z]{2,}(\\/.*)?$/i.test(value)
-  ) {
-    return "https://" + value;
-  }
-
-  return (
-    "https://duckduckgo.com/?q=" +
-    encodeURIComponent(value) +
-    "&kl=se-sv"
-  );
-}
-
-function openDestination(value) {
-
-  const destination =
-    makeDestination(value);
-
-  if (!destination) {
-    return;
-  }
-
-  const frame =
-    document.getElementById("browserFrame");
-
-  const home =
-    document.getElementById("home");
-
-  home.style.display = "none";
-
-  frame.style.display = "block";
-
-  frame.src =
-    "/proxy?url=" +
-    encodeURIComponent(destination);
-}
-
-document
-  .getElementById("mainSearch")
-  .addEventListener(
-    "submit",
-    event => {
-
-      event.preventDefault();
-
-      openDestination(
-        document.getElementById("mainInput").value
-      );
-
+  output = output.replace(
+    /(href|src|action|poster)=["']([^"']+)["']/gi,
+    function (match, attribute, value) {
+      if (
+        value.startsWith("#") ||
+        value.startsWith("data:") ||
+        value.startsWith("javascript:") ||
+        value.startsWith("mailto:") ||
+        value.startsWith("tel:")
+      ) {
+        return match;
+      }
+
+      const absolute = absoluteUrl(value, baseUrl);
+
+      if (!absolute) {
+        return match;
+      }
+
+      if (
+        !absolute.startsWith("http://") &&
+        !absolute.startsWith("https://")
+      ) {
+        return match;
+      }
+
+      return attribute + '="' + proxyUrl(absolute) + '"';
     }
   );
 
-document
-  .getElementById("topSearch")
-  .addEventListener(
-    "submit",
-    event => {
+  output = output.replace(
+    /url\(\s*["']?([^)"']+)["']?\s*\)/gi,
+    function (match, value) {
+      if (
+        value.startsWith("data:") ||
+        value.startsWith("#") ||
+        value.startsWith("http://") ||
+        value.startsWith("https://")
+      ) {
+        return match;
+      }
 
-      event.preventDefault();
+      const absolute = absoluteUrl(value, baseUrl);
 
-      const value =
-        document.getElementById("topInput").value;
+      if (!absolute) {
+        return match;
+      }
 
-      document.getElementById("mainInput").value =
-        value;
-
-      openDestination(value);
-
+      return "url(" + proxyUrl(absolute) + ")";
     }
   );
 
-</script>
+  output = output.replace(
+    /<meta[^>]+http-equiv=["']Content-Security-Policy["'][^>]*>/gi,
+    ""
+  );
 
-</body>
+  return output;
+}
 
-</html>`);
+/* =========================================================
+   PROXY
+   ========================================================= */
 
-});
+app.all("/proxy", async function (req, res) {
+  if (PROXY_KEY) {
+    const suppliedKey = req.headers["x-proxy-key"];
 
-/* -------------------------------------------------------
-   Proxy endpoint
-------------------------------------------------------- */
-
-app.all("/proxy", async (req, res) => {
+    if (suppliedKey !== PROXY_KEY) {
+      return res.status(401).json({
+        error: "Unauthorized"
+      });
+    }
+  }
 
   const rawUrl = req.query.url;
 
-  if (!rawUrl) {
-
+  if (!rawUrl || typeof rawUrl !== "string") {
     return res.status(400).json({
-      error: "Missing URL"
+      error: "Missing url parameter",
+      example: "/proxy?url=https://example.com"
     });
-
   }
 
-  let destination;
+  let target;
 
   try {
-
-    destination =
-      await validateUrl(rawUrl);
-
-  } catch (error) {
-
+    target = new URL(rawUrl);
+  } catch {
     return res.status(400).json({
-
-      error: "Invalid destination",
-
-      message: error.message
-
+      error: "Invalid URL"
     });
-
   }
 
-  const session =
-    getSession(req, res);
-
   try {
+    const addresses = await validateTarget(target);
+    const session = getSession(req, res);
 
-    const headers = {
+    const headers = {};
 
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+    const allowedRequestHeaders = [
+      "accept",
+      "accept-language",
+      "content-type",
+      "referer",
+      "user-agent",
+      "origin"
+    ];
 
-      "Accept":
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    for (const headerName of allowedRequestHeaders) {
+      const value = req.headers[headerName];
 
-      "Accept-Language":
-        "sv-SE,sv;q=0.9,en-US;q=0.8,en;q=0.7",
-
-      "Connection":
-        "close"
-
-    };
-
-    const cookieHeader =
-      getCookieHeader(session);
-
-    if (cookieHeader) {
-      headers.Cookie = cookieHeader;
+      if (value) {
+        headers[headerName] = value;
+      }
     }
 
-    /*
-     * Forward content type for POST requests.
-     */
+    headers["user-agent"] =
+      headers["user-agent"] ||
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36";
 
-    if (req.headers["content-type"]) {
+    const cookieHeader = getCookieHeader(session);
 
-      headers["Content-Type"] =
-        req.headers["content-type"];
-
+    if (cookieHeader) {
+      headers["cookie"] = cookieHeader;
     }
 
     let body = null;
 
-    if (!["GET", "HEAD"].includes(req.method)) {
-
-      if (
-        typeof req.body === "string"
-      ) {
-
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      if (Buffer.isBuffer(req.body)) {
         body = req.body;
-
-      } else if (
-        req.headers["content-type"]?.includes(
-          "application/json"
-        )
-      ) {
-
-        body =
-          JSON.stringify(req.body || {});
-
-      } else if (
-        req.headers["content-type"]?.includes(
-          "application/x-www-form-urlencoded"
-        )
-      ) {
-
-        body =
-          new URLSearchParams(
-            req.body || {}
-          ).toString();
-
+      } else if (typeof req.body === "string") {
+        body = Buffer.from(req.body);
+      } else if (req.body && typeof req.body === "object") {
+        if (
+          req.headers["content-type"] &&
+          String(req.headers["content-type"]).includes(
+            "application/json"
+          )
+        ) {
+          body = Buffer.from(JSON.stringify(req.body));
+        } else {
+          body = Buffer.from(new URLSearchParams(req.body).toString());
+        }
       }
-
-      if (body) {
-        headers["Content-Length"] =
-          Buffer.byteLength(body);
-      }
-
     }
 
-    console.log("");
-    console.log(
-      "[PROXY]",
+    const upstream = await requestTarget(
+      target,
       req.method,
-      destination.href
+      headers,
+      body,
+      addresses
     );
 
-    const upstream =
-      await requestUpstream(
-        destination,
-        {
-          method: req.method,
-          headers,
-          body
-        }
-      );
+    saveCookies(session, upstream.headers["set-cookie"]);
 
-    console.log(
-      "[UPSTREAM]",
-      upstream.statusCode,
-      destination.hostname
-    );
-
-    storeCookies(
-      session,
-      upstream.headers
-    );
-
-    /*
-     * Redirects
-     */
+    const location = upstream.headers.location;
 
     if (
-      upstream.statusCode >= 300 &&
-      upstream.statusCode < 400
+      location &&
+      [301, 302, 303, 307, 308].includes(upstream.statusCode)
     ) {
+      const redirectUrl = absoluteUrl(location, target.toString());
 
-      const location =
-        upstream.headers.location;
-
-      if (location) {
-
-        const redirected =
-          new URL(
-            location,
-            destination
-          );
-
-        await validateUrl(
-          redirected.href
-        );
-
+      if (redirectUrl) {
         return res.redirect(
           upstream.statusCode,
-          "/proxy?url=" +
-          encodeURIComponent(
-            redirected.href
-          )
+          "/proxy?url=" + encodeURIComponent(redirectUrl)
         );
       }
     }
 
-    /*
-     * Copy safe response headers.
-     */
+    let responseBody = upstream.body;
+    const contentType = String(
+      upstream.headers["content-type"] || ""
+    ).toLowerCase();
 
-    const blockedHeaders = new Set([
-      "content-length",
-      "content-encoding",
-      "transfer-encoding",
-      "connection",
-      "keep-alive",
-      "x-frame-options",
-      "content-security-policy"
-    ]);
+    if (contentType.includes("text/html")) {
+      const text = responseBody.toString("utf8");
+      const rewritten = rewriteHtml(text, target.toString());
 
-    for (
-      const [key, value] of
-      Object.entries(upstream.headers)
-    ) {
+      responseBody = Buffer.from(rewritten, "utf8");
+    }
+
+    const responseHeaders = upstream.headers;
+
+    for (const key of Object.keys(responseHeaders)) {
+      const lower = key.toLowerCase();
 
       if (
-        blockedHeaders.has(
-          key.toLowerCase()
-        )
+        lower === "content-length" ||
+        lower === "content-encoding" ||
+        lower === "transfer-encoding" ||
+        lower === "connection" ||
+        lower === "content-security-policy" ||
+        lower === "x-frame-options"
       ) {
         continue;
       }
 
-      if (value === undefined) {
+      if (lower === "set-cookie") {
         continue;
       }
 
-      res.setHeader(key, value);
+      const value = responseHeaders[key];
+
+      if (value !== undefined) {
+        res.setHeader(key, value);
+      }
     }
 
-    /*
-     * HTML rewriting
-     */
+    res.status(upstream.statusCode);
+    res.setHeader("X-Proxy-Upstream", target.hostname);
 
-    const contentType =
-      String(
-        upstream.headers["content-type"] || ""
-      ).toLowerCase();
-
-    if (
-      contentType.includes("text/html") ||
-      contentType.includes("application/xhtml+xml")
-    ) {
-
-      let html =
-        upstream.body.toString("utf8");
-
-      html =
-        rewriteHtml(
-          html,
-          destination.href
-        );
-
-      return res
-        .status(upstream.statusCode)
-        .type("html")
-        .send(html);
-    }
-
-    /*
-     * Images, CSS, JS, JSON, etc.
-     */
-
-    return res
-      .status(upstream.statusCode)
-      .send(upstream.body);
-
+    res.end(responseBody);
   } catch (error) {
-
-    console.error("");
-    console.error(
-      "========== PROXY ERROR =========="
-    );
-
-    console.error(
-      "URL:",
-      destination.href
-    );
-
-    console.error(
-      "Message:",
-      error.message
-    );
-
-    console.error(
-      "Code:",
-      error.code
-    );
-
-    console.error(
-      "================================="
-    );
+    console.error("Proxy error:", error);
 
     return res.status(502).json({
-
       error: "Bad gateway",
-
-      message:
-        error.message ||
-        "Connection to destination failed.",
-
-      code:
-        error.code || null
-
+      message: error.message || "Unknown upstream error",
+      target: target.toString()
     });
-
   }
-
 });
 
-/* -------------------------------------------------------
-   HTML URL rewriting
-------------------------------------------------------- */
+/* =========================================================
+   START PAGE
+   ========================================================= */
 
-function rewriteHtml(
-  html,
-  baseUrl
-) {
+app.get("/", function (req, res) {
+  res.redirect("/browser");
+});
 
-  const base =
-    new URL(baseUrl);
+app.get("/browser", function (req, res) {
+  const html =
+    "<!DOCTYPE html>" +
+    "<html>" +
+    "<head>" +
+    "<meta charset=\"UTF-8\">" +
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
+    "<title>XCloud Browser</title>" +
+    "<style>" +
+    "*{box-sizing:border-box}" +
+    "body{margin:0;background:#111;color:#fff;font-family:Arial,sans-serif}" +
+    ".top{height:64px;background:#1c1c1c;display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid #333}" +
+    ".logo{font-weight:700;font-size:18px;white-space:nowrap}" +
+    "form{display:flex;flex:1;gap:8px}" +
+    "input{flex:1;background:#292929;color:#fff;border:1px solid #444;border-radius:8px;padding:12px;font-size:15px;outline:none}" +
+    "button{background:#fff;color:#111;border:0;border-radius:8px;padding:0 18px;font-weight:700;cursor:pointer}" +
+    ".home{height:calc(100vh - 64px);display:flex;align-items:center;justify-content:center;text-align:center}" +
+    ".box{width:min(700px,90%)}" +
+    "h1{font-size:42px;margin:0 0 10px}" +
+    "p{color:#aaa}" +
+    ".search{margin-top:25px;height:50px}" +
+    ".search button{height:50px}" +
+    "</style>" +
+    "</head>" +
+    "<body>" +
+    "<div class=\"top\">" +
+    "<div class=\"logo\">XCloud Browser</div>" +
+    "<form id=\"nav\">" +
+    "<input id=\"address\" placeholder=\"Search DuckDuckGo or enter a URL...\" autocomplete=\"off\">" +
+    "<button type=\"submit\">Go</button>" +
+    "</form>" +
+    "</div>" +
+    "<div class=\"home\">" +
+    "<div class=\"box\">" +
+    "<h1>DuckDuckGo</h1>" +
+    "<p>Search the web or enter a website address.</p>" +
+    "<form id=\"search\" class=\"search\">" +
+    "<input id=\"query\" placeholder=\"Search the web...\" autocomplete=\"off\">" +
+    "<button type=\"submit\">Search</button>" +
+    "</form>" +
+    "</div>" +
+    "</div>" +
+    "<script>" +
+    "function navigate(value){" +
+    "value=value.trim();" +
+    "if(!value)return;" +
+    "let url;" +
+    "if(value.startsWith('http://')||value.startsWith('https://')){" +
+    "url=value;" +
+    "}else if(value.includes('.')&&!value.includes(' ')){" +
+    "url='https://'+value;" +
+    "}else{" +
+    "url='https://duckduckgo.com/?q='+encodeURIComponent(value)+'&kl=se-sv';" +
+    "}" +
+    "window.location.href='/proxy?url='+encodeURIComponent(url);" +
+    "}" +
+    "document.getElementById('nav').addEventListener('submit',function(e){" +
+    "e.preventDefault();navigate(document.getElementById('address').value);" +
+    "});" +
+    "document.getElementById('search').addEventListener('submit',function(e){" +
+    "e.preventDefault();navigate(document.getElementById('query').value);" +
+    "});" +
+    "</script>" +
+    "</body>" +
+    "</html>";
 
-  /*
-   * Remove CSP and base tags.
-   */
+  res.type("html").send(html);
+});
 
-  html =
-    html.replace(
-      /<meta[^>]+http-equiv=["']?Content-Security-Policy["']?[^>]*>/gi,
-      ""
-    );
+/* =========================================================
+   HEALTH
+   ========================================================= */
 
-  html =
-    html.replace(
-      /<base[^>]*>/gi,
-      ""
-    );
+app.get("/health", function (req, res) {
+  res.json({
+    ok: true,
+    service: "xcloud-test-proxy",
+    runtime: "render",
+    node: process.version,
+    sessions: sessions.size,
+    time: new Date().toISOString()
+  });
+});
 
-  /*
-   * href / src / action
-   */
+/* =========================================================
+   NETWORK DEBUG
+   ========================================================= */
 
-  html =
-    html.replace(
-      /\b(href|src|action)=("([^"]*)"|'([^']*)')/gi,
-      (
-        match,
-        attribute,
-        wrapper,
-        doubleValue,
-        singleValue
-      ) => {
+app.get("/debug-network", async function (req, res) {
+  const tests = [];
 
-        const value =
-          doubleValue ??
-          singleValue ??
-          "";
+  async function testHost(hostname) {
+    const result = {
+      hostname: hostname
+    };
 
-        const rewritten =
-          rewriteUrl(
-            value,
-            base
-          );
+    try {
+      const addresses = await dnsPromises.lookup(hostname, {
+        all: true,
+        verbatim: false
+      });
 
-        if (!rewritten) {
-          return match;
-        }
+      result.dns = addresses;
 
-        return (
-          attribute +
-          '="' +
-          escapeHtml(rewritten) +
-          '"'
-        );
+      const target = new URL("https://" + hostname + "/");
 
-      }
-    );
+      const start = Date.now();
 
-  /*
-   * srcset
-   */
-
-  html =
-    html.replace(
-      /\bsrcset=("([^"]*)"|'([^']*)')/gi,
-      (
-        match,
-        wrapper,
-        doubleValue,
-        singleValue
-      ) => {
-
-        const value =
-          doubleValue ??
-          singleValue ??
-          "";
-
-        const rewritten =
-          value
-            .split(",")
-            .map(item => {
-
-              const pieces =
-                item.trim().split(/\s+/);
-
-              if (!pieces[0]) {
-                return item;
-              }
-
-              const url =
-                rewriteUrl(
-                  pieces[0],
-                  base
-                );
-
-              if (!url) {
-                return item;
-              }
-
-              pieces[0] = url;
-
-              return pieces.join(" ");
-
-            })
-            .join(", ");
-
-        return (
-          'srcset="' +
-          escapeHtml(rewritten) +
-          '"'
-        );
-
-      }
-    );
-
-  /*
-   * Keep navigation inside the proxy.
-   */
-
-  const navigationScript = `
-<script>
-(function () {
-
-  document.addEventListener(
-    "click",
-    function (event) {
-
-      const link =
-        event.target.closest("a");
-
-      if (!link) {
-        return;
-      }
-
-      const href =
-        link.getAttribute("href");
-
-      if (!href) {
-        return;
-      }
-
-      if (
-        href.startsWith("#") ||
-        href.startsWith("javascript:") ||
-        href.startsWith("mailto:") ||
-        href.startsWith("tel:")
-      ) {
-        return;
-      }
-
-      try {
-
-        const absolute =
-          new URL(
-            href,
-            document.baseURI
-          ).href;
-
-        if (
-          absolute.startsWith("http://") ||
-          absolute.startsWith("https://")
-        ) {
-
-          event.preventDefault();
-
-          window.location.href =
-            "/proxy?url=" +
-            encodeURIComponent(
-              absolute
-            );
-
-        }
-
-      } catch (_) {}
-
-    },
-    true
-  );
-
-})();
-</script>
-`;
-
-  if (/<\\/body>/i.test(html)) {
-
-    html =
-      html.replace(
-        /<\\/body>/i,
-        navigationScript +
-        "</body>"
+      const response = await requestTarget(
+        target,
+        "GET",
+        {
+          "user-agent": "XCloud-Debug/1.0",
+          "accept": "*/*"
+        },
+        null,
+        addresses
       );
 
-  } else {
+      result.status = response.statusCode;
+      result.ms = Date.now() - start;
+    } catch (error) {
+      result.error = error.message;
 
-    html += navigationScript;
-
-  }
-
-  return html;
-}
-
-function rewriteUrl(
-  value,
-  base
-) {
-
-  const trimmed =
-    String(value || "").trim();
-
-  if (!trimmed) {
-    return null;
-  }
-
-  if (
-    trimmed.startsWith("#") ||
-    trimmed.startsWith("data:") ||
-    trimmed.startsWith("blob:") ||
-    trimmed.startsWith("javascript:") ||
-    trimmed.startsWith("mailto:") ||
-    trimmed.startsWith("tel:")
-  ) {
-
-    return null;
-
-  }
-
-  try {
-
-    const absolute =
-      new URL(
-        trimmed,
-        base
-      );
-
-    if (
-      !["http:", "https:"].includes(
-        absolute.protocol
-      )
-    ) {
-      return null;
-    }
-
-    return (
-      "/proxy?url=" +
-      encodeURIComponent(
-        absolute.href
-      )
-    );
-
-  } catch {
-
-    return null;
-
-  }
-
-}
-
-/* -------------------------------------------------------
-   Network diagnostics
-------------------------------------------------------- */
-
-app.get(
-  "/debug-network",
-  async (_req, res) => {
-
-    const results = {};
-
-    for (
-      const target of [
-        "https://example.com",
-        "https://duckduckgo.com"
-      ]
-    ) {
-
-      try {
-
-        const url =
-          await validateUrl(target);
-
-        const start =
-          Date.now();
-
-        const response =
-          await requestUpstream(
-            url,
-            {
-              method: "HEAD",
-              headers: {
-                "User-Agent":
-                  "XCloud-Test-Proxy/1.0"
-              }
-            }
-          );
-
-        results[target] = {
-
-          ok: true,
-
-          status:
-            response.statusCode,
-
-          timeMs:
-            Date.now() - start
-
-        };
-
-      } catch (error) {
-
-        results[target] = {
-
-          ok: false,
-
-          message:
-            error.message,
-
-          code:
-            error.code || null
-
-        };
-
+      if (error.code) {
+        result.code = error.code;
       }
-
     }
 
-    res.json({
-      runtime: "Render",
-      node: process.version,
-      results
-    });
-
+    tests.push(result);
   }
-);
 
-/* -------------------------------------------------------
-   Health
-------------------------------------------------------- */
-
-app.get("/health", (_req, res) => {
+  await testHost("example.com");
+  await testHost("duckduckgo.com");
 
   res.json({
-
     ok: true,
-
-    service:
-      "xcloud-test-proxy",
-
-    runtime:
-      "render",
-
-    node:
-      process.version,
-
-    time:
-      new Date().toISOString()
-
+    node: process.version,
+    ipv4First: true,
+    tests: tests
   });
-
 });
 
-/* -------------------------------------------------------
-   WebSocket test
-------------------------------------------------------- */
+/* =========================================================
+   404
+   ========================================================= */
 
-const wss =
-  new WebSocketServer({
-    noServer: true
+app.use(function (req, res) {
+  res.status(404).json({
+    error: "Not found"
   });
+});
 
-const server =
-  http.createServer(app);
+/* =========================================================
+   START
+   ========================================================= */
 
-server.on(
-  "upgrade",
-  (request, socket, head) => {
-
-    const url =
-      new URL(
-        request.url,
-        `http://${request.headers.host}`
-      );
-
-    if (
-      url.pathname !== "/stream"
-    ) {
-
-      socket.destroy();
-
-      return;
-    }
-
-    wss.handleUpgrade(
-      request,
-      socket,
-      head,
-      ws => {
-
-        wss.emit(
-          "connection",
-          ws,
-          request
-        );
-
-      }
-    );
-
-  }
-);
-
-wss.on(
-  "connection",
-  ws => {
-
-    let count = 0;
-
-    const interval =
-      setInterval(() => {
-
-        if (
-          ws.readyState !== ws.OPEN
-        ) {
-
-          clearInterval(interval);
-
-          return;
-        }
-
-        count++;
-
-        ws.send(
-          JSON.stringify({
-
-            type: "packet",
-
-            number: count,
-
-            timestamp:
-              Date.now(),
-
-            message:
-              "Render WebSocket test"
-
-          })
-        );
-
-        if (count >= 30) {
-
-          clearInterval(interval);
-
-          ws.send(
-            JSON.stringify({
-              type: "complete"
-            })
-          );
-
-          ws.close();
-
-        }
-
-      }, 250);
-
-    ws.on(
-      "close",
-      () => {
-        clearInterval(interval);
-      }
-    );
-
-  }
-);
-
-/* -------------------------------------------------------
-   Session cleanup
-------------------------------------------------------- */
-
-setInterval(
-  () => {
-
-    const now =
-      Date.now();
-
-    for (
-      const [id, session]
-      of sessions
-    ) {
-
-      if (
-        now - session.createdAt >
-        24 * 60 * 60 * 1000
-      ) {
-
-        sessions.delete(id);
-
-      }
-
-    }
-
-  },
-  60 * 60 * 1000
-);
-
-/* -------------------------------------------------------
-   Start
-------------------------------------------------------- */
-
-server.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-
-    console.log("");
-    console.log(
-      "================================"
-    );
-    console.log(
-      "XCloud Web Gateway"
-    );
-    console.log(
-      "================================"
-    );
-    console.log(
-      "Port:",
-      PORT
-    );
-    console.log(
-      "Node:",
-      process.version
-    );
-    console.log(
-      "IPv4-first networking: enabled"
-    );
-    console.log(
-      "================================"
-    );
-
-  }
-);
-```
+app.listen(PORT, "0.0.0.0", function () {
+  console.log("");
+  console.log("================================");
+  console.log("XCloud Web Gateway");
+  console.log("================================");
+  console.log("Port: " + PORT);
+  console.log("Node: " + process.version);
+  console.log("IPv4-first networking: enabled");
+  console.log("DuckDuckGo: enabled");
+  console.log("Proxy: enabled");
+  console.log("================================");
+  console.log("");
+});
