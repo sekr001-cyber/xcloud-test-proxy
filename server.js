@@ -12,13 +12,10 @@ const server = http.createServer(app);
 const PORT = Number(process.env.PORT || 10000);
 const PROXY_KEY = process.env.PROXY_KEY || "";
 const REQUEST_TIMEOUT = Number(process.env.REQUEST_TIMEOUT || 30000);
-const MAX_BODY_SIZE = Number(process.env.MAX_BODY_SIZE || 10 * 1024 * 1024);
+const MAX_BODY_SIZE = Number(
+  process.env.MAX_BODY_SIZE || 10 * 1024 * 1024
+);
 
-// Optional:
-// PROXY_ALLOWLIST=example.com,example.org
-//
-// If empty, public HTTP/HTTPS destinations are allowed.
-// Private/local destinations are always blocked.
 const ALLOWLIST = (process.env.PROXY_ALLOWLIST || "")
   .split(",")
   .map((x) => x.trim().toLowerCase())
@@ -26,8 +23,9 @@ const ALLOWLIST = (process.env.PROXY_ALLOWLIST || "")
 
 const UPSTREAM_USER_AGENT =
   process.env.PROXY_USER_AGENT ||
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+  "AppleWebKit/537.36 (KHTML, like Gecko) " +
+  "Chrome/140.0.0.0 Safari/537.36";
 
 const sessions = new Map();
 
@@ -46,8 +44,21 @@ app.use(
   })
 );
 
+/* =========================================================
+   UTILITIES
+   ========================================================= */
+
 function randomId(bytes = 18) {
   return crypto.randomBytes(bytes).toString("hex");
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 function getSessionId(req) {
@@ -60,6 +71,7 @@ function getOrCreateSession(req, res) {
 
   if (!id || !sessions.has(id)) {
     id = randomId();
+
     sessions.set(id, {
       cookies: new Map(),
       createdAt: Date.now(),
@@ -92,14 +104,9 @@ function cleanupSessions() {
 
 setInterval(cleanupSessions, 60 * 60 * 1000).unref();
 
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
+/* =========================================================
+   SSRF PROTECTION
+   ========================================================= */
 
 function isPrivateIPv4(ip) {
   const parts = ip.split(".").map(Number);
@@ -111,13 +118,13 @@ function isPrivateIPv4(ip) {
   const [a, b] = parts;
 
   return (
+    a === 0 ||
     a === 10 ||
     a === 127 ||
-    a === 0 ||
+    (a === 100 && b >= 64 && b <= 127) ||
     (a === 169 && b === 254) ||
     (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168) ||
-    (a === 100 && b >= 64 && b <= 127)
+    (a === 192 && b === 168)
   );
 }
 
@@ -158,7 +165,9 @@ function hostnameAllowed(hostname) {
   }
 
   return ALLOWLIST.some(
-    (allowed) => host === allowed || host.endsWith(`.${allowed}`)
+    (allowed) =>
+      host === allowed ||
+      host.endsWith(`.${allowed}`)
   );
 }
 
@@ -172,41 +181,48 @@ async function validateDestination(url) {
   }
 
   if (!["http:", "https:"].includes(parsed.protocol)) {
-    throw new Error("Only HTTP and HTTPS destinations are supported");
+    throw new Error(
+      "Only HTTP and HTTPS destinations are supported"
+    );
   }
 
   if (parsed.username || parsed.password) {
-    throw new Error("URLs containing credentials are not allowed");
+    throw new Error(
+      "URLs containing credentials are not allowed"
+    );
   }
 
-  const hostname = parsed.hostname.toLowerCase();
+  const hostname = parsed.hostname
+    .toLowerCase()
+    .replace(/\.$/, "");
 
   if (!hostnameAllowed(hostname)) {
-    throw new Error("Destination is not on the proxy allowlist");
+    throw new Error(
+      "Destination is not on the proxy allowlist"
+    );
   }
 
-  // Block obvious local hostnames.
   if (
     hostname === "localhost" ||
-    hostname === "localhost.localdomain" ||
     hostname.endsWith(".localhost") ||
     hostname.endsWith(".local") ||
     hostname === "ip6-localhost"
   ) {
-    throw new Error("Local destinations are blocked");
+    throw new Error(
+      "Local destinations are blocked"
+    );
   }
 
-  // Direct IP address.
   if (net.isIP(hostname)) {
     if (isPrivateAddress(hostname)) {
-      throw new Error("Private/internal destinations are blocked");
+      throw new Error(
+        "Private/internal destinations are blocked"
+      );
     }
 
     return parsed;
   }
 
-  // Resolve the hostname and make sure it does not resolve to
-  // a private/internal address.
   let addresses;
 
   try {
@@ -215,26 +231,36 @@ async function validateDestination(url) {
       verbatim: true,
     });
   } catch {
-    throw new Error("Unable to resolve destination hostname");
+    throw new Error(
+      "Unable to resolve destination hostname"
+    );
   }
 
   if (!addresses.length) {
-    throw new Error("Destination hostname did not resolve");
+    throw new Error(
+      "Destination hostname did not resolve"
+    );
   }
 
   for (const address of addresses) {
     if (isPrivateAddress(address.address)) {
-      throw new Error("Destination resolves to a private/internal address");
+      throw new Error(
+        "Destination resolves to a private/internal address"
+      );
     }
   }
 
   return parsed;
 }
 
-function getForwardHeaders(req, session, targetUrl) {
+/* =========================================================
+   REQUEST HEADERS / COOKIES
+   ========================================================= */
+
+function getForwardHeaders(req, session) {
   const headers = new Headers();
 
-  const allowedRequestHeaders = [
+  const allowedHeaders = [
     "accept",
     "accept-language",
     "cache-control",
@@ -249,53 +275,49 @@ function getForwardHeaders(req, session, targetUrl) {
     "user-agent",
   ];
 
-  for (const name of allowedRequestHeaders) {
+  for (const name of allowedHeaders) {
     const value = req.headers[name];
 
     if (value) {
-      headers.set(name, Array.isArray(value) ? value.join(", ") : value);
+      headers.set(
+        name,
+        Array.isArray(value)
+          ? value.join(", ")
+          : value
+      );
     }
   }
 
-  headers.set("user-agent", UPSTREAM_USER_AGENT);
+  headers.set(
+    "user-agent",
+    UPSTREAM_USER_AGENT
+  );
 
   if (!headers.has("accept")) {
     headers.set(
       "accept",
-      "text/html,application/xhtml+xml,application/xml;q=0.9," +
-        "image/avif,image/webp,image/apng,*/*;q=0.8"
+      "text/html,application/xhtml+xml,application/xml;" +
+        "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
     );
   }
 
   if (!headers.has("accept-language")) {
-    headers.set("accept-language", "en-US,en;q=0.9");
+    headers.set(
+      "accept-language",
+      "en-US,en;q=0.9"
+    );
   }
 
-  const storedCookies = [...session.cookies.entries()]
+  const cookies = [...session.cookies.entries()]
     .map(([name, value]) => `${name}=${value}`)
     .join("; ");
 
-  if (storedCookies) {
-    headers.set("cookie", storedCookies);
+  if (cookies) {
+    headers.set("cookie", cookies);
   }
 
-  // Forward a useful referrer when the client supplies one.
-  if (req.headers.referer) {
-    try {
-      const ref = new URL(req.headers.referer);
-
-      if (["http:", "https:"].includes(ref.protocol)) {
-        headers.set("referer", ref.href);
-      }
-    } catch {
-      // Ignore invalid referrer.
-    }
-  }
-
-  // Host is generated by fetch for the destination.
   headers.delete("host");
 
-  // These are hop-by-hop headers and should not be forwarded.
   for (const name of [
     "connection",
     "proxy-connection",
@@ -312,13 +334,17 @@ function getForwardHeaders(req, session, targetUrl) {
 }
 
 function storeUpstreamCookies(response, session) {
-  if (typeof response.headers.getSetCookie !== "function") {
+  if (
+    typeof response.headers.getSetCookie !==
+    "function"
+  ) {
     return;
   }
 
-  const setCookies = response.headers.getSetCookie();
+  const cookies =
+    response.headers.getSetCookie();
 
-  for (const rawCookie of setCookies) {
+  for (const rawCookie of cookies) {
     const firstPart = rawCookie.split(";")[0];
     const separator = firstPart.indexOf("=");
 
@@ -326,8 +352,13 @@ function storeUpstreamCookies(response, session) {
       continue;
     }
 
-    const name = firstPart.slice(0, separator).trim();
-    const value = firstPart.slice(separator + 1).trim();
+    const name = firstPart
+      .slice(0, separator)
+      .trim();
+
+    const value = firstPart
+      .slice(separator + 1)
+      .trim();
 
     if (name) {
       session.cookies.set(name, value);
@@ -335,124 +366,52 @@ function storeUpstreamCookies(response, session) {
   }
 }
 
+/* =========================================================
+   PROXY HELPERS
+   ========================================================= */
+
 function makeProxyUrl(url) {
   return `/proxy?url=${encodeURIComponent(url)}`;
 }
 
-function rewriteHtml(html, baseUrl) {
-  // Remove CSP meta tags that would prevent resources from loading
-  // through the proxy.
-  html = html.replace(
-    /<meta\b[^>]*http-equiv\s*=\s*["']content-security-policy["'][^>]*>/gi,
-    ""
-  );
-
-  html = html.replace(
-    /<meta\b[^>]*http-equiv\s*=\s*["']content-security-policy-report-only["'][^>]*>/gi,
-    ""
-  );
-
-  function rewriteAttribute(match, prefix, quote, value) {
-    const trimmed = value.trim();
-
-    if (
-      !trimmed ||
-      trimmed.startsWith("#") ||
-      trimmed.startsWith("data:") ||
-      trimmed.startsWith("blob:") ||
-      trimmed.startsWith("javascript:") ||
-      trimmed.startsWith("mailto:") ||
-      trimmed.startsWith("tel:")
-    ) {
-      return match;
-    }
-
-    try {
-      const absolute = new URL(trimmed, baseUrl);
-
-      if (!["http:", "https:"].includes(absolute.protocol)) {
-        return match;
-      }
-
-      return `${prefix}${quote}${makeProxyUrl(absolute.href)}${quote}`;
-    } catch {
-      return match;
-    }
+function getRequestBody(req) {
+  if (
+    req.method === "GET" ||
+    req.method === "HEAD"
+  ) {
+    return undefined;
   }
 
-  html = html.replace(
-    /(\b(?:href|src|action|poster)\s*=\s*)(["'])([^"']+)\2/gi,
-    (match, prefix, quote, value) =>
-      rewriteAttribute(match, prefix, quote, value)
-  );
-
-  html = html.replace(
-    /\b(srcset\s*=\s*)(["'])([^"']+)\2/gi,
-    (match, prefix, quote, value) => {
-      const rewritten = value
-        .split(",")
-        .map((part) => {
-          const pieces = part.trim().split(/\s+/);
-          const source = pieces.shift();
-
-          if (!source) {
-            return part;
-          }
-
-          try {
-            const absolute = new URL(source, baseUrl);
-
-            if (!["http:", "https:"].includes(absolute.protocol)) {
-              return part;
-            }
-
-            return [
-              makeProxyUrl(absolute.href),
-              ...pieces,
-            ].join(" ");
-          } catch {
-            return part;
-          }
-        })
-        .join(", ");
-
-      return `${prefix}${quote}${rewritten}${quote}`;
-    }
-  );
-
-  html = html.replace(
-    /(<base\b[^>]*\bhref\s*=\s*)(["'])([^"']+)\2/gi,
-    (match, prefix, quote, value) => {
-      try {
-        const absolute = new URL(value, baseUrl);
-
-        if (!["http:", "https:"].includes(absolute.protocol)) {
-          return match;
-        }
-
-        return `${prefix}${quote}${makeProxyUrl(absolute.href)}${quote}`;
-      } catch {
-        return match;
-      }
-    }
-  );
-
-  return html;
-}
-
-function stripHopByHopResponseHeaders(res) {
-  for (const header of [
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-  ]) {
-    res.removeHeader(header);
+  if (
+    req.body === undefined ||
+    req.body === null
+  ) {
+    return undefined;
   }
+
+  const contentType = String(
+    req.headers["content-type"] || ""
+  );
+
+  if (
+    contentType.includes("application/json")
+  ) {
+    return JSON.stringify(req.body);
+  }
+
+  if (
+    contentType.includes(
+      "application/x-www-form-urlencoded"
+    )
+  ) {
+    return new URLSearchParams(req.body).toString();
+  }
+
+  if (typeof req.body === "string") {
+    return req.body;
+  }
+
+  return JSON.stringify(req.body);
 }
 
 function copyResponseHeaders(upstream, res) {
@@ -474,7 +433,18 @@ function copyResponseHeaders(upstream, res) {
     }
   }
 
-  stripHopByHopResponseHeaders(res);
+  for (const header of [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+  ]) {
+    res.removeHeader(header);
+  }
 }
 
 function checkProxyKey(req, res) {
@@ -490,7 +460,8 @@ function checkProxyKey(req, res) {
   if (supplied !== PROXY_KEY) {
     res.status(401).json({
       error: "Unauthorized",
-      message: "A valid proxy key is required.",
+      message:
+        "A valid proxy key is required.",
     });
 
     return false;
@@ -499,125 +470,219 @@ function checkProxyKey(req, res) {
   return true;
 }
 
-function getRequestBody(req) {
-  if (["GET", "HEAD"].includes(req.method)) {
-    return undefined;
+/* =========================================================
+   HTML REWRITING
+   ========================================================= */
+
+function rewriteHtml(html, baseUrl) {
+  html = html.replace(
+    /<meta\b[^>]*http-equiv\s*=\s*["']content-security-policy["'][^>]*>/gi,
+    ""
+  );
+
+  html = html.replace(
+    /<meta\b[^>]*http-equiv\s*=\s*["']content-security-policy-report-only["'][^>]*>/gi,
+    ""
+  );
+
+  function rewriteUrl(value) {
+    const trimmed = value.trim();
+
+    if (
+      !trimmed ||
+      trimmed.startsWith("#") ||
+      trimmed.startsWith("data:") ||
+      trimmed.startsWith("blob:") ||
+      trimmed.startsWith("javascript:") ||
+      trimmed.startsWith("mailto:") ||
+      trimmed.startsWith("tel:")
+    ) {
+      return value;
+    }
+
+    try {
+      const absolute = new URL(
+        trimmed,
+        baseUrl
+      );
+
+      if (
+        !["http:", "https:"].includes(
+          absolute.protocol
+        )
+      ) {
+        return value;
+      }
+
+      return makeProxyUrl(
+        absolute.href
+      );
+    } catch {
+      return value;
+    }
   }
 
-  if (req.body === undefined || req.body === null) {
-    return undefined;
-  }
+  html = html.replace(
+    /(\b(?:href|src|action|poster)\s*=\s*)(["'])([^"']+)\2/gi,
+    (match, prefix, quote, value) => {
+      return (
+        prefix +
+        quote +
+        rewriteUrl(value) +
+        quote
+      );
+    }
+  );
 
-  const contentType = String(req.headers["content-type"] || "");
+  html = html.replace(
+    /\b(srcset\s*=\s*)(["'])([^"']+)\2/gi,
+    (match, prefix, quote, value) => {
+      const rewritten = value
+        .split(",")
+        .map((part) => {
+          const pieces = part
+            .trim()
+            .split(/\s+/);
 
-  if (contentType.includes("application/json")) {
-    return JSON.stringify(req.body);
-  }
+          const source = pieces.shift();
 
-  if (contentType.includes("application/x-www-form-urlencoded")) {
-    return new URLSearchParams(req.body).toString();
-  }
+          if (!source) {
+            return part;
+          }
 
-  if (typeof req.body === "string") {
-    return req.body;
-  }
+          const newSource =
+            rewriteUrl(source);
 
-  return JSON.stringify(req.body);
+          return [
+            newSource,
+            ...pieces,
+          ].join(" ");
+        })
+        .join(", ");
+
+      return (
+        prefix +
+        quote +
+        rewritten +
+        quote
+      );
+    }
+  );
+
+  html = html.replace(
+    /(<base\b[^>]*\bhref\s*=\s*)(["'])([^"']+)\2/gi,
+    (match, prefix, quote, value) => {
+      try {
+        const absolute = new URL(
+          value,
+          baseUrl
+        );
+
+        return (
+          prefix +
+          quote +
+          makeProxyUrl(
+            absolute.href
+          ) +
+          quote
+        );
+      } catch {
+        return match;
+      }
+    }
+  );
+
+  return html;
 }
 
-/*
- * Home
- */
+/* =========================================================
+   HOME
+   ========================================================= */
+
 app.get("/", (req, res) => {
   res.redirect("/browser");
 });
 
-/*
- * Simple login/session page
- */
+/* =========================================================
+   LOGIN / SESSION
+   ========================================================= */
+
 app.get("/login", (req, res) => {
-  const session = getOrCreateSession(req, res);
+  getOrCreateSession(req, res);
 
   res.send(`
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <title>Proxy Session</title>
-  <style>
-    body {
-      font-family: Arial, sans-serif;
-      max-width: 800px;
-      margin: 50px auto;
-      padding: 20px;
-      background: #f5f5f5;
-    }
-
-    .box {
-      background: white;
-      padding: 25px;
-      border-radius: 12px;
-      box-shadow: 0 4px 20px rgba(0,0,0,.08);
-    }
-
-    code {
-      word-break: break-all;
-    }
-  </style>
+<meta charset="utf-8">
+<title>Proxy Session</title>
+<style>
+body {
+  font-family: Arial, sans-serif;
+  max-width: 800px;
+  margin: 50px auto;
+  padding: 20px;
+  background: #f5f5f5;
+}
+.box {
+  background: white;
+  padding: 25px;
+  border-radius: 12px;
+  box-shadow: 0 4px 20px rgba(0,0,0,.08);
+}
+a {
+  color: #1769ff;
+}
+</style>
 </head>
 <body>
-  <div class="box">
-    <h1>Proxy session</h1>
-    <p>Session created successfully.</p>
-    <p><strong>Session:</strong></p>
-    <code>${escapeHtml(
-      [...sessions.entries()].find(([, value]) => value === session)?.[0] ||
-        "active"
-    )}</code>
-
-    <p><a href="/browser">Open proxy browser</a></p>
-    <p><a href="/session">Session diagnostics</a></p>
-  </div>
+<div class="box">
+<h1>Proxy session</h1>
+<p>Your proxy session has been created.</p>
+<p><a href="/browser">Open browser</a></p>
+<p><a href="/session">View session</a></p>
+</div>
 </body>
 </html>
 `);
 });
 
-/*
- * Session diagnostics
- */
 app.get("/session", (req, res) => {
   const sessionId = getSessionId(req);
 
-  if (!sessionId || !sessions.has(sessionId)) {
-    return res.status(401).send(`
-      <h1>No proxy session</h1>
-      <p><a href="/login">Create session</a></p>
-    `);
+  if (
+    !sessionId ||
+    !sessions.has(sessionId)
+  ) {
+    return res.status(401).json({
+      authenticated: false,
+    });
   }
 
-  const session = sessions.get(sessionId);
+  const session = sessions.get(
+    sessionId
+  );
 
   res.json({
     authenticated: true,
-    sessionCreated: new Date(session.createdAt).toISOString(),
-    sessionLastUsed: new Date(session.lastUsed).toISOString(),
-    upstreamCookies: session.cookies.size,
-    endpoints: {
-      browser: "/browser",
-      proxy: "/proxy?url=https://example.com",
-      health: "/health",
-    },
+    createdAt: new Date(
+      session.createdAt
+    ).toISOString(),
+    lastUsed: new Date(
+      session.lastUsed
+    ).toISOString(),
+    upstreamCookies:
+      session.cookies.size,
   });
 });
 
-/*
- * API session check
- */
 app.get("/api/session", (req, res) => {
   const sessionId = getSessionId(req);
 
-  if (!sessionId || !sessions.has(sessionId)) {
+  if (
+    !sessionId ||
+    !sessions.has(sessionId)
+  ) {
     return res.status(401).json({
       authenticated: false,
     });
@@ -628,416 +693,773 @@ app.get("/api/session", (req, res) => {
   });
 });
 
-/*
- * Browser UI
- */
+/* =========================================================
+   PROXY BROWSER
+   ========================================================= */
+
 app.get("/browser", (req, res) => {
   res.send(`
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>VPS Web Proxy</title>
 
-  <style>
-    * {
-      box-sizing: border-box;
-    }
+<meta charset="utf-8">
 
-    body {
-      margin: 0;
-      background: #111;
-      color: #fff;
-      font-family: Arial, sans-serif;
-    }
+<meta
+  name="viewport"
+  content="width=device-width,initial-scale=1"
+>
 
-    .toolbar {
-      height: 62px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 10px;
-      background: #1d1d1d;
-      border-bottom: 1px solid #333;
-    }
+<title>XCloud Browser</title>
 
-    button {
-      height: 40px;
-      padding: 0 14px;
-      border: 0;
-      border-radius: 8px;
-      cursor: pointer;
-      background: #333;
-      color: white;
-    }
+<style>
 
-    button:hover {
-      background: #444;
-    }
+* {
+  box-sizing: border-box;
+}
 
-    form {
-      display: flex;
-      flex: 1;
-      gap: 8px;
-    }
+html,
+body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: Arial, sans-serif;
+  background: #111;
+  color: white;
+}
 
-    input {
-      flex: 1;
-      min-width: 0;
-      height: 40px;
-      border: 1px solid #444;
-      border-radius: 8px;
-      background: #111;
-      color: white;
-      padding: 0 12px;
-      outline: none;
-    }
+.toolbar {
+  height: 62px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  background: #181818;
+  border-bottom: 1px solid #333;
+}
 
-    iframe {
-      display: block;
-      width: 100%;
-      height: calc(100vh - 62px);
-      border: 0;
-      background: white;
-    }
-  </style>
+button {
+  height: 40px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 8px;
+  background: #303030;
+  color: white;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+button:hover {
+  background: #414141;
+}
+
+form {
+  display: flex;
+  flex: 1;
+  gap: 8px;
+}
+
+input {
+  flex: 1;
+  min-width: 0;
+  height: 40px;
+  border: 1px solid #444;
+  border-radius: 8px;
+  background: #101010;
+  color: white;
+  padding: 0 14px;
+  font-size: 15px;
+  outline: none;
+}
+
+input:focus {
+  border-color: #777;
+}
+
+iframe {
+  display: block;
+  width: 100%;
+  height: calc(100vh - 62px);
+  border: 0;
+  background: white;
+}
+
+</style>
+
 </head>
 
 <body>
-  <div class="toolbar">
-    <button onclick="goBack()">←</button>
-    <button onclick="goForward()">→</button>
-    <button onclick="reloadFrame()">↻</button>
 
-    <form id="form">
-      <input
-        id="url"
-        autocomplete="off"
-        placeholder="https://example.com"
-        value="https://example.com"
-      >
-      <button type="submit">Go</button>
-    </form>
-  </div>
+<div class="toolbar">
 
-  <iframe id="frame"></iframe>
+<button
+  type="button"
+  onclick="goBack()"
+  title="Back"
+>
+←
+</button>
 
-  <script>
-    const input = document.getElementById("url");
-    const frame = document.getElementById("frame");
-    const form = document.getElementById("form");
+<button
+  type="button"
+  onclick="goForward()"
+  title="Forward"
+>
+→
+</button>
 
-    function normalizeUrl(value) {
-      value = value.trim();
+<button
+  type="button"
+  onclick="reloadFrame()"
+  title="Reload"
+>
+↻
+</button>
 
-      if (!value) {
-        return "https://example.com";
-      }
+<form id="form">
 
-      if (!/^https?:\\/\\//i.test(value)) {
-        value = "https://" + value;
-      }
+<input
+  id="address"
+  autocomplete="off"
+  spellcheck="false"
+  placeholder="Search DuckDuckGo or enter a URL"
+>
 
-      return value;
-    }
+<button type="submit">
+Go
+</button>
 
-    function navigate(value) {
-      const target = normalizeUrl(value);
-      input.value = target;
-      frame.src = "/proxy?url=" + encodeURIComponent(target);
-    }
+</form>
 
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      navigate(input.value);
-    });
+</div>
 
-    frame.addEventListener("load", () => {
-      try {
-        input.value = frame.contentWindow.location.href;
-      } catch {
-        // Cross-origin access is intentionally unavailable.
-      }
-    });
+<iframe
+  id="frame"
+  title="Proxy Browser"
+></iframe>
 
-    function reloadFrame() {
-      frame.contentWindow.location.reload();
-    }
+<script>
 
-    function goBack() {
-      frame.contentWindow.history.back();
-    }
+const form =
+  document.getElementById("form");
 
-    function goForward() {
-      frame.contentWindow.history.forward();
-    }
+const address =
+  document.getElementById("address");
 
-    navigate(input.value);
-  </script>
+const frame =
+  document.getElementById("frame");
+
+
+function isUrl(value) {
+
+  return /^https?:\\/\\//i.test(value);
+
+}
+
+
+function looksLikeDomain(value) {
+
+  return /^[a-z0-9.-]+\\.[a-z]{2,}(?::\\d+)?(?:\\/.*)?$/i
+    .test(value);
+
+}
+
+
+function buildDestination(value) {
+
+  value = value.trim();
+
+  if (!value) {
+
+    return "https://duckduckgo.com/";
+
+  }
+
+  /*
+   * Explicit URL.
+   */
+
+  if (isUrl(value)) {
+
+    return value;
+
+  }
+
+  /*
+   * Domain without protocol.
+   */
+
+  if (looksLikeDomain(value)) {
+
+    return "https://" + value;
+
+  }
+
+  /*
+   * Search query.
+   *
+   * DuckDuckGo search.
+   */
+
+  return (
+    "https://duckduckgo.com/?q=" +
+    encodeURIComponent(value) +
+    "&kl=se-sv"
+  );
+
+}
+
+
+function navigate(value) {
+
+  const destination =
+    buildDestination(value);
+
+  address.value = destination;
+
+  frame.src =
+    "/proxy?url=" +
+    encodeURIComponent(destination);
+
+}
+
+
+form.addEventListener(
+  "submit",
+  function(event) {
+
+    event.preventDefault();
+
+    navigate(address.value);
+
+  }
+);
+
+
+function reloadFrame() {
+
+  try {
+
+    frame.contentWindow.location.reload();
+
+  } catch {
+
+    frame.src = frame.src;
+
+  }
+
+}
+
+
+function goBack() {
+
+  try {
+
+    frame.contentWindow.history.back();
+
+  } catch {}
+
+}
+
+
+function goForward() {
+
+  try {
+
+    frame.contentWindow.history.forward();
+
+  } catch {}
+
+}
+
+
+/*
+ * Start with DuckDuckGo.
+ */
+
+navigate("");
+
+</script>
+
 </body>
 </html>
 `);
 });
 
-/*
- * Main proxy endpoint
- */
+/* =========================================================
+   MAIN HTTP/HTTPS PROXY
+   ========================================================= */
+
 app.all("/proxy", async (req, res) => {
+
   if (!checkProxyKey(req, res)) {
     return;
   }
 
   const target = req.query.url;
 
-  if (typeof target !== "string" || !target.trim()) {
+  if (
+    typeof target !== "string" ||
+    !target.trim()
+  ) {
     return res.status(400).json({
       error: "Missing URL",
-      usage: "/proxy?url=https://example.com",
+      usage:
+        "/proxy?url=https://example.com",
     });
   }
 
   let targetUrl;
 
   try {
-    targetUrl = await validateDestination(target);
+
+    targetUrl =
+      await validateDestination(target);
+
   } catch (error) {
+
     return res.status(403).json({
       error: "Destination blocked",
       message: error.message,
     });
+
   }
 
-  const session = getOrCreateSession(req, res);
+  const session =
+    getOrCreateSession(req, res);
 
-  const headers = getForwardHeaders(req, session, targetUrl);
-  const body = getRequestBody(req);
+  const headers =
+    getForwardHeaders(
+      req,
+      session
+    );
 
-  const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    REQUEST_TIMEOUT
-  );
+  const body =
+    getRequestBody(req);
+
+  const controller =
+    new AbortController();
+
+  const timeout =
+    setTimeout(
+      () =>
+        controller.abort(),
+      REQUEST_TIMEOUT
+    );
 
   try {
+
     console.log(
       `[PROXY] ${req.method} ${targetUrl.href}`
     );
 
-    const upstream = await fetch(targetUrl.href, {
-      method: req.method,
-      headers,
-      body,
-      redirect: "manual",
-      signal: controller.signal,
-    });
+    const upstream =
+      await fetch(
+        targetUrl.href,
+        {
+          method: req.method,
+          headers,
+          body,
+          redirect: "manual",
+          signal:
+            controller.signal,
+        }
+      );
 
-    storeUpstreamCookies(upstream, session);
+    storeUpstreamCookies(
+      upstream,
+      session
+    );
 
     /*
-     * Handle redirects ourselves so the next request still passes
-     * through this proxy.
+     * Redirect handling.
      */
+
     if (
       upstream.status >= 300 &&
-      upstream.status < 400 &&
-      upstream.headers.get("location")
+      upstream.status < 400
     ) {
-      const location = upstream.headers.get("location");
 
-      try {
-        const absolute = new URL(location, targetUrl);
+      const location =
+        upstream.headers.get(
+          "location"
+        );
 
-        if (
-          ["http:", "https:"].includes(absolute.protocol)
-        ) {
-          await validateDestination(absolute.href);
+      if (location) {
 
-          return res.redirect(
-            upstream.status,
-            makeProxyUrl(absolute.href)
-          );
+        try {
+
+          const absolute =
+            new URL(
+              location,
+              targetUrl
+            );
+
+          if (
+            ["http:", "https:"].includes(
+              absolute.protocol
+            )
+          ) {
+
+            await validateDestination(
+              absolute.href
+            );
+
+            return res.redirect(
+              upstream.status,
+              makeProxyUrl(
+                absolute.href
+              )
+            );
+
+          }
+
+        } catch {
+          // Return original response.
         }
-      } catch {
-        // Fall through and return the original response.
       }
     }
 
-    copyResponseHeaders(upstream, res);
+    copyResponseHeaders(
+      upstream,
+      res
+    );
 
-    res.status(upstream.status);
+    res.status(
+      upstream.status
+    );
 
     const contentType =
-      upstream.headers.get("content-type") || "";
+      upstream.headers.get(
+        "content-type"
+      ) || "";
 
     /*
-     * HTML must be rewritten so links, forms and assets continue
-     * through the proxy.
+     * HTML.
      */
-    if (contentType.includes("text/html")) {
-      const text = await upstream.text();
 
-      const rewritten = rewriteHtml(
-        text,
-        targetUrl.href
-      );
+    if (
+      contentType.includes(
+        "text/html"
+      )
+    ) {
+
+      const text =
+        await upstream.text();
+
+      const rewritten =
+        rewriteHtml(
+          text,
+          targetUrl.href
+        );
 
       res.setHeader(
         "content-type",
         "text/html; charset=utf-8"
       );
 
-      return res.send(rewritten);
+      return res.send(
+        rewritten
+      );
     }
 
     /*
-     * For non-HTML resources, stream the response directly.
+     * Everything else.
      */
+
     if (upstream.body) {
-      const reader = upstream.body.getReader();
+
+      const reader =
+        upstream.body.getReader();
 
       try {
+
         while (true) {
-          const { done, value } = await reader.read();
+
+          const {
+            done,
+            value,
+          } =
+            await reader.read();
 
           if (done) {
             break;
           }
 
-          if (!res.write(Buffer.from(value))) {
-            await new Promise((resolve) =>
-              res.once("drain", resolve)
+          if (
+            !res.write(
+              Buffer.from(value)
+            )
+          ) {
+
+            await new Promise(
+              (resolve) =>
+                res.once(
+                  "drain",
+                  resolve
+                )
             );
+
           }
         }
+
       } finally {
+
         reader.releaseLock();
+
       }
 
       return res.end();
     }
 
     return res.end();
-  } catch (error) {
-    console.error("[PROXY ERROR]", error);
 
-    if (error.name === "AbortError") {
+  } catch (error) {
+
+    console.error(
+      "[PROXY ERROR]",
+      error
+    );
+
+    if (
+      error.name ===
+      "AbortError"
+    ) {
+
       return res.status(504).json({
-        error: "Gateway timeout",
-        message: `The destination did not respond within ${REQUEST_TIMEOUT}ms.`,
+        error:
+          "Gateway timeout",
+        message:
+          `The destination did not respond within ${REQUEST_TIMEOUT}ms.`,
       });
+
     }
 
     return res.status(502).json({
-      error: "Bad gateway",
-      message: error.message || "Unable to contact destination",
+      error:
+        "Bad gateway",
+      message:
+        error.message ||
+        "Unable to contact destination",
     });
+
   } finally {
+
     clearTimeout(timeout);
+
   }
+
 });
 
-/*
- * Health check
- */
+/* =========================================================
+   HEALTH
+   ========================================================= */
+
 app.get("/health", (req, res) => {
+
   res.json({
     status: "ok",
-    service: "xcloud-test-proxy",
-    uptime: process.uptime(),
-    node: process.version,
-    time: new Date().toISOString(),
+    service:
+      "xcloud-test-proxy",
+    uptime:
+      process.uptime(),
+    node:
+      process.version,
+    time:
+      new Date().toISOString(),
   });
+
 });
 
-/*
- * Simple WebSocket test endpoint.
- *
- * This is intentionally a test stream rather than a generic WebSocket
- * tunneling service.
- */
-const wss = new WebSocketServer({
-  noServer: true,
-});
+/* =========================================================
+   WEBSOCKET TEST
+   ========================================================= */
 
-server.on("upgrade", (request, socket, head) => {
-  const url = new URL(
-    request.url,
-    `http://${request.headers.host || "localhost"}`
-  );
-
-  if (url.pathname !== "/stream") {
-    socket.destroy();
-    return;
-  }
-
-  wss.handleUpgrade(request, socket, head, (ws) => {
-    wss.emit("connection", ws, request);
+const wss =
+  new WebSocketServer({
+    noServer: true,
   });
-});
 
-wss.on("connection", (ws) => {
-  let counter = 0;
+server.on(
+  "upgrade",
+  (request, socket, head) => {
 
-  const interval = setInterval(() => {
-    if (ws.readyState !== ws.OPEN) {
-      clearInterval(interval);
+    const url =
+      new URL(
+        request.url,
+        `http://${
+          request.headers.host ||
+          "localhost"
+        }`
+      );
+
+    if (
+      url.pathname !==
+      "/stream"
+    ) {
+
+      socket.destroy();
       return;
+
     }
 
-    counter++;
+    wss.handleUpgrade(
+      request,
+      socket,
+      head,
+      (ws) => {
 
-    const payload = Buffer.alloc(1024);
+        wss.emit(
+          "connection",
+          ws,
+          request
+        );
 
-    payload.writeUInt32BE(counter, 0);
-    payload.writeUInt32BE(Date.now() >>> 0, 4);
+      }
+    );
 
-    ws.send(payload);
+  }
+);
 
-    if (counter >= 30) {
-      clearInterval(interval);
-      ws.close(1000, "Test stream complete");
-    }
-  }, 250);
+wss.on(
+  "connection",
+  (ws) => {
 
-  ws.on("close", () => {
-    clearInterval(interval);
-  });
-});
+    let counter = 0;
 
-/*
- * Generic 404
- */
-app.use((req, res) => {
-  res.status(404).json({
-    error: "Not found",
-  });
-});
+    const interval =
+      setInterval(
+        () => {
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`
+          if (
+            ws.readyState !==
+            ws.OPEN
+          ) {
+
+            clearInterval(
+              interval
+            );
+
+            return;
+          }
+
+          counter++;
+
+          const payload =
+            Buffer.alloc(1024);
+
+          payload.writeUInt32BE(
+            counter,
+            0
+          );
+
+          payload.writeUInt32BE(
+            Date.now() >>> 0,
+            4
+          );
+
+          ws.send(payload);
+
+          if (
+            counter >= 30
+          ) {
+
+            clearInterval(
+              interval
+            );
+
+            ws.close(
+              1000,
+              "Test stream complete"
+            );
+
+          }
+
+        },
+        250
+      );
+
+    ws.on(
+      "close",
+      () => {
+        clearInterval(
+          interval
+        );
+      }
+    );
+
+  }
+);
+
+/* =========================================================
+   404
+   ========================================================= */
+
+app.use(
+  (req, res) => {
+
+    res.status(404).json({
+      error: "Not found",
+    });
+
+  }
+);
+
+/* =========================================================
+   START
+   ========================================================= */
+
+server.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
+
+    console.log(`
 ========================================
  XCloud VPS Proxy
 ========================================
- Port:        ${PORT}
- Node:        ${process.version}
- Timeout:     ${REQUEST_TIMEOUT}ms
- Allowlist:   ${
-   ALLOWLIST.length ? ALLOWLIST.join(", ") : "public HTTP/HTTPS"
- }
- Proxy key:   ${PROXY_KEY ? "enabled" : "disabled"}
 
- Browser:
-   /browser
+Port:
+  ${PORT}
 
- Proxy:
-   /proxy?url=https://example.com
+Node:
+  ${process.version}
 
- Health:
-   /health
+Timeout:
+  ${REQUEST_TIMEOUT}ms
 
- WebSocket test:
-   /stream
+Allowlist:
+  ${
+    ALLOWLIST.length
+      ? ALLOWLIST.join(", ")
+      : "Public HTTP/HTTPS"
+  }
+
+Proxy key:
+  ${
+    PROXY_KEY
+      ? "Enabled"
+      : "Disabled"
+  }
+
+Browser:
+  /browser
+
+Proxy:
+  /proxy?url=https://example.com
+
+Health:
+  /health
+
+WebSocket test:
+  /stream
+
+Search engine:
+  DuckDuckGo
+
 ========================================
 `);
-});
+
+  }
+);
